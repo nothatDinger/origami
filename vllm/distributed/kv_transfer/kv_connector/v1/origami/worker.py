@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import OrigamiConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import native_cpu
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.chunking import (
+    PlannedChunk,
+    plan_head_channel_chunks,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.cpu_qat import (
     CpuLosslessCodec,
 )
@@ -36,6 +41,9 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata
 
 
+_NATIVE_LAYOUT_KEY = "origami_native_layout"
+
+
 def _layer_index(layer_name: str) -> int:
     digits = ""
     for ch in reversed(layer_name):
@@ -49,6 +57,13 @@ def _layer_index(layer_name: str) -> int:
 def _config_hash(config: dict[str, Any]) -> str:
     encoded = json.dumps(config, sort_keys=True, default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _product(values: list[int] | tuple[int, ...]) -> int:
+    result = 1
+    for value in values:
+        result *= int(value)
+    return result
 
 
 class OrigamiConnectorWorker:
@@ -68,6 +83,10 @@ class OrigamiConnectorWorker:
         self.cpu_codec = CpuLosslessCodec(
             backend=config.lossless_cpu_backend,
             allow_zlib_fallback=config.allow_zlib_fallback,
+            dynamic_huffman=config.qat_dynamic_huffman,
+            qat_inflight=config.qat_inflight,
+            qat_batch=config.qat_batch,
+            qat_max_instances=config.qat_max_instances,
         )
         self._gpu_codec: GpuLosslessCodec | None = None
         self.kv_caches: dict[str, torch.Tensor] = {}
@@ -194,23 +213,20 @@ class OrigamiConnectorWorker:
         return None
 
     def _restore_symbols(self, layer_payload: LayerPayload, path: str) -> torch.Tensor:
-        restored_chunks: list[torch.Tensor] = []
         if path == "gpu":
             codec = self._get_gpu_codec()
+            restored_chunks = []
             for chunk in layer_payload.chunks:
                 compressed = chunk.compressed.to("cuda", non_blocking=True)
                 restored_chunks.append(
-                    codec.decompress(compressed, output_bytes=chunk.unpacked_bytes)
+                    codec.decompress(compressed, output_bytes=chunk.unpacked_bytes).cpu()
                 )
-            return torch.cat(restored_chunks).cpu()
-        for chunk in layer_payload.chunks:
-            restored_chunks.append(
-                self.cpu_codec.decompress(
-                    chunk.compressed,
-                    output_bytes=chunk.unpacked_bytes,
-                )
-            )
-        return torch.cat(restored_chunks)
+            return self._unpack_native_symbols(layer_payload, restored_chunks)
+
+        compressed_chunks = [chunk.compressed for chunk in layer_payload.chunks]
+        output_bytes = [int(chunk.unpacked_bytes) for chunk in layer_payload.chunks]
+        restored_chunks = self.cpu_codec.decompress_many(compressed_chunks, output_bytes)
+        return self._unpack_native_symbols(layer_payload, restored_chunks)
 
     def _get_gpu_codec(self) -> GpuLosslessCodec:
         if self._gpu_codec is None:
@@ -229,27 +245,30 @@ class OrigamiConnectorWorker:
         )
         kv_blocks = kv_layer[block_ids_tensor].detach()
         quantized = self.quantizer.quantize(kv_blocks)
-        flat = quantized.symbols.reshape(-1).to(torch.uint8).cpu().contiguous()
+        raw_chunks, planned_chunks, native_metadata = self._pack_quantized_symbols(
+            quantized.symbols,
+            quantized.metadata,
+            layer_name,
+        )
+        compressed_chunks = self.cpu_codec.compress_many(raw_chunks)
         chunks: list[ChunkRecord] = []
-        offset = 0
-        chunk_id = 0
-        while offset < int(flat.numel()):
-            end = min(offset + self.config.chunk_target_bytes, int(flat.numel()))
-            raw = flat[offset:end].contiguous()
-            compressed = self.cpu_codec.compress(raw)
+        for idx, (planned, raw, compressed) in enumerate(
+            zip(planned_chunks, raw_chunks, compressed_chunks)
+        ):
+            plan_layout = planned.layout
             layout = ChunkLayout(
-                layer_index=_layer_index(layer_name),
-                head_start=0,
-                head_end=0,
-                channel_start=offset,
-                channel_end=end,
+                layer_index=plan_layout.layer_index,
+                head_start=plan_layout.head_start,
+                head_end=plan_layout.head_end,
+                channel_start=plan_layout.channel_start,
+                channel_end=plan_layout.channel_end,
                 token_start=save.token_start,
                 token_end=save.token_start + save.num_tokens,
                 unpacked_bytes=int(raw.numel()),
             )
             chunks.append(
                 ChunkRecord(
-                    chunk_id=chunk_id,
+                    chunk_id=idx,
                     layout=layout,
                     codec=self.config.lossless_cpu_backend,
                     compressed=compressed,
@@ -257,19 +276,149 @@ class OrigamiConnectorWorker:
                     unpacked_bytes=int(raw.numel()),
                 )
             )
-            offset = end
-            chunk_id += 1
+        quant_metadata = dict(quantized.metadata)
+        quant_metadata[_NATIVE_LAYOUT_KEY] = native_metadata
         layer_payload = LayerPayload(
             layer_name=layer_name,
             quantizer=self.quantizer.quantizer_id,
-            quant_metadata=quantized.metadata,
+            quant_metadata=quant_metadata,
             chunks=chunks,
         )
         return save, layer_payload
+
+    def _pack_quantized_symbols(
+        self,
+        symbols: torch.Tensor,
+        metadata: dict[str, Any],
+        layer_name: str,
+    ) -> tuple[list[torch.Tensor], list[PlannedChunk], dict[str, Any]]:
+        flat = symbols.reshape(-1).to(torch.uint8).cpu().contiguous()
+        if int(flat.numel()) == 0:
+            return [], [], {
+                "version": 1,
+                "bits": 8,
+                "token_count": 1,
+                "num_heads": 1,
+                "head_dim": 1,
+                "symbol_count": 0,
+                "layout_policy": self.config.layout_policy,
+                "bitpack": bool(self.config.bitpack),
+                "chunk_specs": [],
+            }
+        bits, token_count, num_heads, head_dim = self._infer_symbol_layout(flat, metadata)
+        planned_chunks = plan_head_channel_chunks(
+            layer_index=_layer_index(layer_name),
+            num_heads=num_heads,
+            head_dim=head_dim,
+            token_count=token_count,
+            bytes_per_symbol=1,
+            min_bytes=self.config.chunk_min_bytes,
+            target_bytes=self.config.chunk_target_bytes,
+            max_bytes=self.config.chunk_max_bytes,
+        )
+        if not planned_chunks and int(flat.numel()) > 0:
+            planned_chunks = [
+                PlannedChunk(
+                    chunk_id=0,
+                    layout=ChunkLayout(
+                        layer_index=_layer_index(layer_name),
+                        head_start=0,
+                        head_end=1,
+                        channel_start=0,
+                        channel_end=int(flat.numel()),
+                        token_start=0,
+                        token_end=1,
+                        unpacked_bytes=int(flat.numel()),
+                    ),
+                )
+            ]
+        specs = [self._layout_to_spec(chunk.layout) for chunk in planned_chunks]
+        raw_chunks = native_cpu.pack_head_channel_chunks(
+            flat,
+            bits,
+            token_count,
+            num_heads,
+            head_dim,
+            specs,
+        )
+        native_metadata = {
+            "version": 1,
+            "bits": bits,
+            "token_count": token_count,
+            "num_heads": num_heads,
+            "head_dim": head_dim,
+            "symbol_count": int(flat.numel()),
+            "layout_policy": self.config.layout_policy,
+            "bitpack": bool(self.config.bitpack),
+            "chunk_specs": specs,
+        }
+        return raw_chunks, planned_chunks, native_metadata
+
+    def _infer_symbol_layout(
+        self,
+        symbols: torch.Tensor,
+        metadata: dict[str, Any],
+    ) -> tuple[int, int, int, int]:
+        symbol_count = int(symbols.numel())
+        requested_bits = int(
+            metadata.get("origami_bits", metadata.get("bits", metadata.get("quant_bits", 8)))
+        )
+        bits = requested_bits if requested_bits in {2, 4, 8} else 8
+        if not self.config.bitpack:
+            bits = 8
+
+        shape = metadata.get("origami_symbol_shape")
+        if isinstance(shape, (list, tuple)) and len(shape) == 3:
+            token_count, num_heads, head_dim = [int(v) for v in shape]
+            if token_count > 0 and num_heads > 0 and head_dim > 0 and (
+                _product([token_count, num_heads, head_dim]) == symbol_count
+            ):
+                return bits, token_count, num_heads, head_dim
+
+        # Adapter stubs currently expose serialized bytes rather than real
+        # [token, head, channel] symbols. Keep them roundtrippable through the
+        # same native pack/unpack ABI with an 8-bit flat logical layout.
+        return 8, 1, 1, max(1, symbol_count)
+
+    @staticmethod
+    def _layout_to_spec(layout: ChunkLayout) -> list[int]:
+        return [
+            int(layout.head_start),
+            int(layout.head_end),
+            int(layout.channel_start),
+            int(layout.channel_end),
+            int(layout.token_start),
+            int(layout.token_end),
+        ]
+
+    def _unpack_native_symbols(
+        self,
+        layer_payload: LayerPayload,
+        raw_chunks: list[torch.Tensor],
+    ) -> torch.Tensor:
+        native_metadata = layer_payload.quant_metadata.get(_NATIVE_LAYOUT_KEY)
+        if not native_metadata:
+            return torch.cat([chunk.detach().cpu().to(torch.uint8).reshape(-1) for chunk in raw_chunks])
+        specs = native_metadata.get("chunk_specs", [])
+        if len(specs) != len(raw_chunks):
+            raise RuntimeError(
+                "Origami native layout metadata chunk count does not match payload chunks"
+            )
+        if not specs:
+            return torch.empty((0,), dtype=torch.uint8)
+        symbols = native_cpu.unpack_head_channel_chunks(
+            raw_chunks,
+            int(native_metadata["bits"]),
+            int(native_metadata["token_count"]),
+            int(native_metadata["num_heads"]),
+            int(native_metadata["head_dim"]),
+            specs,
+        )
+        symbol_count = int(native_metadata.get("symbol_count", symbols.numel()))
+        return symbols.reshape(-1)[:symbol_count].contiguous()
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         return set(), set()
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=True)
-

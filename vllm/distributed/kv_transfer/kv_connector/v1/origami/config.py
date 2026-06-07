@@ -51,6 +51,7 @@ class OrigamiConfig:
     qat_inflight: int = 32
     qat_batch: int = 32
     qat_max_instances: int = 16
+    qat_dynamic_huffman: bool = True
     allow_zlib_fallback: bool = False
     batch_policy: str = "restored_priority_mixed"
 
@@ -104,6 +105,9 @@ class OrigamiConfig:
             qat_batch=int(_get_extra(vllm_config, "origami_qat_batch", 32)),
             qat_max_instances=int(
                 _get_extra(vllm_config, "origami_qat_max_instances", 16)
+            ),
+            qat_dynamic_huffman=bool(
+                _get_extra(vllm_config, "origami_qat_dynamic_huffman", True)
             ),
             allow_zlib_fallback=bool(
                 _get_extra(vllm_config, "origami_allow_zlib_fallback", False)

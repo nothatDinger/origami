@@ -202,6 +202,13 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
     "DecodeBenchConnector",
 )
+
+KVConnectorFactory.register_connector(
+    "OrigamiConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.origami.connector",
+    "OrigamiConnector",
+)
+
 KVConnectorFactory.register_connector(
     "MooncakeConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",

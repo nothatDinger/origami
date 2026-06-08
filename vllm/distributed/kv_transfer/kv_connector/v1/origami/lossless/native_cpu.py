@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import torch
 from torch.utils.cpp_extension import load
@@ -21,6 +21,24 @@ _BUILD_ROOT = Path(
     )
 )
 _VERBOSE = bool(int(os.environ.get("ORIGAMI_NATIVE_VERBOSE", "0")))
+_REQUIRED_AXES = ("token", "head", "head_dim")
+_AXIS_ALIASES = {
+    "token": "token",
+    "tokens": "token",
+    "seq": "token",
+    "sequence": "token",
+    "head": "head",
+    "heads": "head",
+    "kv_head": "head",
+    "kv_heads": "head",
+    "head_dim": "head_dim",
+    "channel": "head_dim",
+    "channels": "head_dim",
+    "dim": "head_dim",
+    "layer": "layer",
+    "layers": "layer",
+}
+STORAGE_LAYOUT = ["layer", "head", "head_dim", "token"]
 
 
 def _build_dir(name: str) -> str:
@@ -32,10 +50,10 @@ def _build_dir(name: str) -> str:
 @lru_cache(maxsize=1)
 def load_bitpack_extension() -> Any:
     return load(
-        name="origami_bitpack_cpu",
+        name="origami_bitpack_cpu_v2",
         sources=[str(_CSRC / "bitpack_layout.cpp")],
         extra_cflags=["-O3"],
-        build_directory=_build_dir("bitpack"),
+        build_directory=_build_dir("bitpack_v2"),
         verbose=_VERBOSE,
     )
 
@@ -53,8 +71,68 @@ def load_qat_extension() -> Any:
     )
 
 
+def normalize_symbol_layout(layout: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    for axis in layout:
+        key = str(axis).lower()
+        if key not in _AXIS_ALIASES:
+            raise ValueError(f"Unsupported Origami symbol layout axis {axis!r}")
+        normalized.append(_AXIS_ALIASES[key])
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"Origami symbol layout axes must be unique: {layout!r}")
+    for required in _REQUIRED_AXES:
+        if required not in normalized:
+            raise ValueError(
+                "Origami symbol layout must include token, head, and head_dim axes"
+            )
+    extra = set(normalized) - set(_REQUIRED_AXES) - {"layer"}
+    if extra:
+        raise ValueError(f"Unsupported Origami symbol layout axes: {sorted(extra)}")
+    if len(normalized) not in {3, 4}:
+        raise ValueError("Origami symbol layout supports rank 3 or rank 4")
+    return normalized
+
+
+def canonical_axis_sizes(
+    source_shape: Sequence[int],
+    source_layout: Sequence[str],
+) -> tuple[int, int, int, list[int], list[str]]:
+    shape = [int(dim) for dim in source_shape]
+    layout = normalize_symbol_layout(source_layout)
+    if len(shape) != len(layout):
+        raise ValueError("origami_symbol_shape rank must match origami_symbol_layout")
+    if len(shape) not in {3, 4}:
+        raise ValueError("origami_symbol_shape supports rank 3 or rank 4")
+    if any(dim <= 0 for dim in shape):
+        raise ValueError("origami_symbol_shape dimensions must be positive")
+    if "layer" in layout and shape[layout.index("layer")] != 1:
+        raise ValueError("per-layer Origami worker requires layer axis size 1")
+    token_count = shape[layout.index("token")]
+    num_heads = shape[layout.index("head")]
+    head_dim = shape[layout.index("head_dim")]
+    return token_count, num_heads, head_dim, shape, layout
+
+
+def axis_positions(source_layout: Sequence[str]) -> list[int]:
+    layout = normalize_symbol_layout(source_layout)
+    return [
+        layout.index("token"),
+        layout.index("head"),
+        layout.index("head_dim"),
+        layout.index("layer") if "layer" in layout else -1,
+    ]
+
+
 def _cpu_u8(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().cpu().to(torch.uint8).reshape(-1).contiguous()
+
+
+def _shape_tensor(source_shape: Sequence[int]) -> torch.Tensor:
+    return torch.tensor([int(dim) for dim in source_shape], dtype=torch.int64).contiguous()
+
+
+def _axis_tensor(source_layout: Sequence[str]) -> torch.Tensor:
+    return torch.tensor(axis_positions(source_layout), dtype=torch.int64).contiguous()
 
 
 def _chunk_specs_tensor(chunk_specs: torch.Tensor | Iterable[Iterable[int]]) -> torch.Tensor:
@@ -72,6 +150,57 @@ def _chunk_specs_tensor(chunk_specs: torch.Tensor | Iterable[Iterable[int]]) -> 
     return specs.contiguous()
 
 
+def pack_canonical_storage_chunks(
+    symbols: torch.Tensor,
+    bits: int,
+    source_shape: Sequence[int],
+    source_layout: Sequence[str],
+    chunk_specs: torch.Tensor | Iterable[Iterable[int]],
+) -> list[torch.Tensor]:
+    token_count, num_heads, head_dim, shape, layout = canonical_axis_sizes(
+        source_shape, source_layout
+    )
+    ext = load_bitpack_extension()
+    specs = _chunk_specs_tensor(chunk_specs)
+    return list(
+        ext.pack_canonical_storage_chunks(
+            _cpu_u8(symbols),
+            int(bits),
+            _shape_tensor(shape),
+            _axis_tensor(layout),
+            int(token_count),
+            int(num_heads),
+            int(head_dim),
+            specs,
+        )
+    )
+
+
+def unpack_canonical_storage_chunks(
+    chunks: Iterable[torch.Tensor],
+    bits: int,
+    source_shape: Sequence[int],
+    source_layout: Sequence[str],
+    chunk_specs: torch.Tensor | Iterable[Iterable[int]],
+) -> torch.Tensor:
+    token_count, num_heads, head_dim, shape, layout = canonical_axis_sizes(
+        source_shape, source_layout
+    )
+    ext = load_bitpack_extension()
+    specs = _chunk_specs_tensor(chunk_specs)
+    cpu_chunks = [_cpu_u8(chunk) for chunk in chunks]
+    return ext.unpack_canonical_storage_chunks(
+        cpu_chunks,
+        int(bits),
+        _shape_tensor(shape),
+        _axis_tensor(layout),
+        int(token_count),
+        int(num_heads),
+        int(head_dim),
+        specs,
+    )
+
+
 def pack_head_channel_chunks(
     symbols: torch.Tensor,
     bits: int,
@@ -80,17 +209,12 @@ def pack_head_channel_chunks(
     head_dim: int,
     chunk_specs: torch.Tensor | Iterable[Iterable[int]],
 ) -> list[torch.Tensor]:
-    ext = load_bitpack_extension()
-    specs = _chunk_specs_tensor(chunk_specs)
-    return list(
-        ext.pack_head_channel_chunks(
-            _cpu_u8(symbols),
-            int(bits),
-            int(token_count),
-            int(num_heads),
-            int(head_dim),
-            specs,
-        )
+    return pack_canonical_storage_chunks(
+        symbols,
+        bits,
+        [int(token_count), int(num_heads), int(head_dim)],
+        ["token", "head", "head_dim"],
+        chunk_specs,
     )
 
 
@@ -102,16 +226,12 @@ def unpack_head_channel_chunks(
     head_dim: int,
     chunk_specs: torch.Tensor | Iterable[Iterable[int]],
 ) -> torch.Tensor:
-    ext = load_bitpack_extension()
-    specs = _chunk_specs_tensor(chunk_specs)
-    cpu_chunks = [_cpu_u8(chunk) for chunk in chunks]
-    return ext.unpack_head_channel_chunks(
-        cpu_chunks,
-        int(bits),
-        int(token_count),
-        int(num_heads),
-        int(head_dim),
-        specs,
+    return unpack_canonical_storage_chunks(
+        chunks,
+        bits,
+        [int(token_count), int(num_heads), int(head_dim)],
+        ["token", "head", "head_dim"],
+        chunk_specs,
     )
 
 

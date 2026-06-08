@@ -251,6 +251,8 @@ def test_worker_save_restore_roundtrip_with_mock_quantizer_and_zlib() -> None:
     layer_payload = stored_payload.layer_payloads["layer_0"]
     native_layout = layer_payload.quant_metadata["origami_native_layout"]
     assert native_layout["bits"] == 8
+    assert native_layout["source_layout"] == ["head", "token", "head_dim"]
+    assert native_layout["storage_layout"] == ["layer", "head", "head_dim", "token"]
     assert native_layout["chunk_specs"]
     assert layer_payload.chunks[0].unpacked_bytes > 0
 
@@ -309,6 +311,112 @@ def test_native_bitpack_layout_roundtrip_for_2_4_8_bits() -> None:
         )
 
         assert torch.equal(restored, symbols)
+
+
+
+
+def test_native_canonical_storage_order_for_source_layouts() -> None:
+    token_count = 3
+    num_heads = 2
+    head_dim = 4
+    base = torch.arange(token_count * num_heads * head_dim, dtype=torch.uint8).reshape(
+        token_count,
+        num_heads,
+        head_dim,
+    )
+    specs = torch.tensor(
+        [[0, num_heads, 0, head_dim, 0, token_count]],
+        dtype=torch.int64,
+    )
+
+    for layout in (
+        ["token", "head", "head_dim"],
+        ["head", "token", "head_dim"],
+        ["head", "head_dim", "token"],
+    ):
+        source = base.permute([{"token": 0, "head": 1, "head_dim": 2}[axis] for axis in layout])
+        packed = native_cpu.pack_canonical_storage_chunks(
+            source.contiguous().reshape(-1),
+            8,
+            list(source.shape),
+            layout,
+            specs,
+        )
+        expected = base.permute(1, 2, 0).contiguous().reshape(-1)
+        assert torch.equal(packed[0], expected)
+        restored = native_cpu.unpack_canonical_storage_chunks(
+            packed,
+            8,
+            list(source.shape),
+            layout,
+            specs,
+        )
+        assert torch.equal(restored, source.contiguous().reshape(-1))
+
+
+def test_native_canonical_storage_rank4_layer_axis_roundtrip() -> None:
+    token_count = 3
+    num_heads = 2
+    head_dim = 4
+    base = torch.arange(token_count * num_heads * head_dim, dtype=torch.uint8).reshape(
+        1,
+        token_count,
+        num_heads,
+        head_dim,
+    )
+    layout = ["layer", "token", "head", "head_dim"]
+    specs = torch.tensor(
+        [[0, num_heads, 0, head_dim, 0, token_count]],
+        dtype=torch.int64,
+    )
+
+    packed = native_cpu.pack_canonical_storage_chunks(
+        base.reshape(-1),
+        8,
+        list(base.shape),
+        layout,
+        specs,
+    )
+    expected = base.squeeze(0).permute(1, 2, 0).contiguous().reshape(-1)
+    restored = native_cpu.unpack_canonical_storage_chunks(
+        packed,
+        8,
+        list(base.shape),
+        layout,
+        specs,
+    )
+
+    assert torch.equal(packed[0], expected)
+    assert torch.equal(restored, base.reshape(-1))
+
+
+def test_worker_requires_quantizer_symbol_shape_and_layout_metadata() -> None:
+    worker = OrigamiConnectorWorker(
+        OrigamiConfig(lossless_cpu_backend="zlib", qat_threads=1),
+        InMemoryOrigamiStore(f"missing-layout-{uuid4()}"),
+    )
+
+    try:
+        worker._pack_quantized_symbols(
+            torch.arange(12, dtype=torch.uint8),
+            {"origami_symbol_shape": [3, 2, 2]},
+            "layer_0",
+        )
+    except ValueError as exc:
+        assert "origami_symbol_layout" in str(exc)
+    else:
+        raise AssertionError("missing origami_symbol_layout should fail")
+
+    try:
+        worker._pack_quantized_symbols(
+            torch.arange(12, dtype=torch.uint8),
+            {"origami_symbol_layout": ["token", "head", "head_dim"]},
+            "layer_0",
+        )
+    except ValueError as exc:
+        assert "origami_symbol_shape" in str(exc)
+    else:
+        raise AssertionError("missing origami_symbol_shape should fail")
 
 
 def test_native_bitpack_combined_head_channel_specs_roundtrip() -> None:

@@ -43,6 +43,9 @@ class TorchSerializedTensorAdapter(QuantizerAdapter):
                 "dtype": str(kv.dtype).replace("torch.", ""),
                 "shape": list(kv.shape),
                 "device": str(kv.device),
+                "origami_bits": 8,
+                "origami_symbol_shape": [1, 1, len(data)],
+                "origami_symbol_layout": ["token", "head", "head_dim"],
             },
         )
 

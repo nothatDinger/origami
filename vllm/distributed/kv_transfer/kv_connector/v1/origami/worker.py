@@ -293,19 +293,29 @@ class OrigamiConnectorWorker:
         layer_name: str,
     ) -> tuple[list[torch.Tensor], list[PlannedChunk], dict[str, Any]]:
         flat = symbols.reshape(-1).to(torch.uint8).cpu().contiguous()
+        (
+            bits,
+            source_shape,
+            source_layout,
+            token_count,
+            num_heads,
+            head_dim,
+        ) = self._parse_symbol_layout(flat, metadata)
         if int(flat.numel()) == 0:
             return [], [], {
-                "version": 1,
-                "bits": 8,
-                "token_count": 1,
-                "num_heads": 1,
-                "head_dim": 1,
+                "version": 2,
+                "bits": bits,
+                "source_shape": source_shape,
+                "source_layout": source_layout,
+                "storage_layout": native_cpu.STORAGE_LAYOUT,
+                "token_count": token_count,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
                 "symbol_count": 0,
                 "layout_policy": self.config.layout_policy,
                 "bitpack": bool(self.config.bitpack),
                 "chunk_specs": [],
             }
-        bits, token_count, num_heads, head_dim = self._infer_symbol_layout(flat, metadata)
         planned_chunks = plan_head_channel_chunks(
             layer_index=_layer_index(layer_name),
             num_heads=num_heads,
@@ -333,17 +343,19 @@ class OrigamiConnectorWorker:
                 )
             ]
         specs = [self._layout_to_spec(chunk.layout) for chunk in planned_chunks]
-        raw_chunks = native_cpu.pack_head_channel_chunks(
+        raw_chunks = native_cpu.pack_canonical_storage_chunks(
             flat,
             bits,
-            token_count,
-            num_heads,
-            head_dim,
+            source_shape,
+            source_layout,
             specs,
         )
         native_metadata = {
-            "version": 1,
+            "version": 2,
             "bits": bits,
+            "source_shape": source_shape,
+            "source_layout": source_layout,
+            "storage_layout": native_cpu.STORAGE_LAYOUT,
             "token_count": token_count,
             "num_heads": num_heads,
             "head_dim": head_dim,
@@ -354,31 +366,35 @@ class OrigamiConnectorWorker:
         }
         return raw_chunks, planned_chunks, native_metadata
 
-    def _infer_symbol_layout(
+    def _parse_symbol_layout(
         self,
         symbols: torch.Tensor,
         metadata: dict[str, Any],
-    ) -> tuple[int, int, int, int]:
-        symbol_count = int(symbols.numel())
+    ) -> tuple[int, list[int], list[str], int, int, int]:
+        if "origami_symbol_shape" not in metadata:
+            raise ValueError("Origami quantizer metadata must include origami_symbol_shape")
+        if "origami_symbol_layout" not in metadata:
+            raise ValueError("Origami quantizer metadata must include origami_symbol_layout")
+
         requested_bits = int(
             metadata.get("origami_bits", metadata.get("bits", metadata.get("quant_bits", 8)))
         )
-        bits = requested_bits if requested_bits in {2, 4, 8} else 8
-        if not self.config.bitpack:
-            bits = 8
+        if requested_bits not in {2, 4, 8}:
+            raise ValueError("origami_bits must be one of 2, 4, or 8")
+        bits = requested_bits if self.config.bitpack else 8
 
-        shape = metadata.get("origami_symbol_shape")
-        if isinstance(shape, (list, tuple)) and len(shape) == 3:
-            token_count, num_heads, head_dim = [int(v) for v in shape]
-            if token_count > 0 and num_heads > 0 and head_dim > 0 and (
-                _product([token_count, num_heads, head_dim]) == symbol_count
-            ):
-                return bits, token_count, num_heads, head_dim
-
-        # Adapter stubs currently expose serialized bytes rather than real
-        # [token, head, channel] symbols. Keep them roundtrippable through the
-        # same native pack/unpack ABI with an 8-bit flat logical layout.
-        return 8, 1, 1, max(1, symbol_count)
+        token_count, num_heads, head_dim, source_shape, source_layout = (
+            native_cpu.canonical_axis_sizes(
+                metadata["origami_symbol_shape"],
+                metadata["origami_symbol_layout"],
+            )
+        )
+        symbol_count = int(symbols.numel())
+        if _product(source_shape) != symbol_count:
+            raise ValueError(
+                "Origami quantizer symbol count must equal origami_symbol_shape product"
+            )
+        return bits, source_shape, source_layout, token_count, num_heads, head_dim
 
     @staticmethod
     def _layout_to_spec(layout: ChunkLayout) -> list[int]:
@@ -406,12 +422,11 @@ class OrigamiConnectorWorker:
             )
         if not specs:
             return torch.empty((0,), dtype=torch.uint8)
-        symbols = native_cpu.unpack_head_channel_chunks(
+        symbols = native_cpu.unpack_canonical_storage_chunks(
             raw_chunks,
             int(native_metadata["bits"]),
-            int(native_metadata["token_count"]),
-            int(native_metadata["num_heads"]),
-            int(native_metadata["head_dim"]),
+            native_metadata["source_shape"],
+            native_metadata["source_layout"],
             specs,
         )
         symbol_count = int(native_metadata.get("symbol_count", symbols.numel()))

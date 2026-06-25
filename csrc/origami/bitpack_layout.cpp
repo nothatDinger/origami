@@ -48,8 +48,8 @@ void check_cpu_i64(const torch::Tensor& tensor, const char* name) {
 }
 
 void check_bits(const int64_t bits) {
-  TORCH_CHECK(bits == 2 || bits == 4 || bits == 8,
-              "Origami bitpack supports only 2, 4, or 8 bit symbols");
+  TORCH_CHECK(bits >= 1 && bits <= 8,
+              "Origami bitpack supports only 1..8 bit symbols");
 }
 
 int64_t product_shape(const SourceLayout& layout) {
@@ -183,40 +183,24 @@ void pack_spec_scalar(const uint8_t* src,
                       const ChunkSpec& spec,
                       const int64_t bits,
                       const SourceLayout& layout) {
-  if (bits == 8) {
-    int64_t out = 0;
-    for (int64_t head = spec.head_start; head < spec.head_end; ++head) {
-      for (int64_t channel = spec.channel_start; channel < spec.channel_end;
-           ++channel) {
-        for (int64_t token = spec.token_start; token < spec.token_end; ++token) {
-          dst[out++] = src[source_index(layout, token, head, channel)];
-        }
-      }
-    }
-    return;
-  }
-
-  uint8_t current = 0;
-  int slot = 0;
-  int64_t out = 0;
   const uint8_t mask = static_cast<uint8_t>((1u << bits) - 1u);
+  int64_t symbol = 0;
   for (int64_t head = spec.head_start; head < spec.head_end; ++head) {
     for (int64_t channel = spec.channel_start; channel < spec.channel_end;
          ++channel) {
       for (int64_t token = spec.token_start; token < spec.token_end; ++token) {
         const uint8_t value = src[source_index(layout, token, head, channel)] & mask;
-        current = static_cast<uint8_t>(current | (value << (slot * bits)));
-        ++slot;
-        if (slot * bits == 8) {
-          dst[out++] = current;
-          current = 0;
-          slot = 0;
+        const int64_t bit_pos = symbol * bits;
+        const int64_t byte_idx = bit_pos >> 3;
+        const int shift = static_cast<int>(bit_pos & 7);
+        dst[byte_idx] = static_cast<uint8_t>(dst[byte_idx] | (value << shift));
+        if (shift + bits > 8) {
+          dst[byte_idx + 1] =
+              static_cast<uint8_t>(dst[byte_idx + 1] | (value >> (8 - shift)));
         }
+        ++symbol;
       }
     }
-  }
-  if (slot != 0) {
-    dst[out++] = current;
   }
 }
 
@@ -226,37 +210,24 @@ void unpack_spec_scalar(const uint8_t* src,
                         const ChunkSpec& spec,
                         const int64_t bits,
                         const SourceLayout& layout) {
-  if (bits == 8) {
-    int64_t in = 0;
-    for (int64_t head = spec.head_start; head < spec.head_end; ++head) {
-      for (int64_t channel = spec.channel_start; channel < spec.channel_end;
-           ++channel) {
-        for (int64_t token = spec.token_start; token < spec.token_end; ++token) {
-          TORCH_CHECK(in < src_bytes, "Origami chunk is shorter than expected");
-          dst[source_index(layout, token, head, channel)] = src[in++];
-        }
-      }
-    }
-    return;
-  }
-
   const uint8_t mask = static_cast<uint8_t>((1u << bits) - 1u);
-  int slot = 0;
-  int64_t in = 0;
-  uint8_t current = src_bytes > 0 ? src[0] : 0;
+  int64_t symbol = 0;
   for (int64_t head = spec.head_start; head < spec.head_end; ++head) {
     for (int64_t channel = spec.channel_start; channel < spec.channel_end;
          ++channel) {
       for (int64_t token = spec.token_start; token < spec.token_end; ++token) {
-        TORCH_CHECK(in < src_bytes, "Origami chunk is shorter than expected");
-        const uint8_t value = static_cast<uint8_t>((current >> (slot * bits)) & mask);
-        dst[source_index(layout, token, head, channel)] = value;
-        ++slot;
-        if (slot * bits == 8) {
-          ++in;
-          slot = 0;
-          current = in < src_bytes ? src[in] : 0;
+        const int64_t bit_pos = symbol * bits;
+        const int64_t byte_idx = bit_pos >> 3;
+        const int shift = static_cast<int>(bit_pos & 7);
+        TORCH_CHECK(byte_idx < src_bytes, "Origami chunk is shorter than expected");
+        uint16_t packed = src[byte_idx];
+        if (shift + bits > 8 && byte_idx + 1 < src_bytes) {
+          packed = static_cast<uint16_t>(packed |
+                                         (static_cast<uint16_t>(src[byte_idx + 1]) << 8));
         }
+        const uint8_t value = static_cast<uint8_t>((packed >> shift) & mask);
+        dst[source_index(layout, token, head, channel)] = value;
+        ++symbol;
       }
     }
   }
@@ -292,7 +263,7 @@ std::vector<torch::Tensor> pack_canonical_storage_chunks_impl(
     const ChunkSpec spec =
         read_spec(spec_ptr + idx * 6, token_count, num_heads, head_dim);
     const int64_t bytes = packed_bytes_for_symbols(spec_symbol_count(spec), bits);
-    auto output = torch::empty({bytes}, torch::dtype(torch::kUInt8));
+    auto output = torch::zeros({bytes}, torch::dtype(torch::kUInt8));
     pack_spec_scalar(src, output.data_ptr<uint8_t>(), spec, bits, layout);
     outputs.push_back(output);
   }

@@ -51,10 +51,17 @@ def plan_head_channel_chunks(
         remaining_heads = num_heads - head
         full_head_bytes = _bytes_for_shape(token_count, head_dim, bytes_per_symbol)
 
-        if full_head_bytes < min_bytes and remaining_heads > 1:
+        if full_head_bytes < target_bytes and remaining_heads > 1:
             heads_per_chunk = min(
                 remaining_heads,
-                max(1, min(max_channels // head_dim, remaining_heads)),
+                max(
+                    1,
+                    min(
+                        target_channels // head_dim,
+                        max_channels // head_dim,
+                        remaining_heads,
+                    ),
+                ),
             )
             while (
                 heads_per_chunk < remaining_heads
@@ -114,4 +121,3 @@ def plan_head_channel_chunks(
         head += 1
 
     return chunks
-

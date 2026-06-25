@@ -11,8 +11,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.cachegen_
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kvquant_adapter import (
     KVQuantAdapter,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kivi_adapter import (
+    KiviAdapter,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.mock_int4 import (
     MockInt4Adapter,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.raw_tensor import (
+    RawBytesTensorAdapter,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.turboquant_adapter import (
     TurboQuantAdapter,
@@ -20,9 +26,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.turboquan
 
 _REGISTRY: dict[str, type[QuantizerAdapter]] = {
     "cachegen": CacheGenAdapter,
+    "kivi": KiviAdapter,
     "kvquant": KVQuantAdapter,
     "turboquant": TurboQuantAdapter,
     "mock_int4": MockInt4Adapter,
+    "raw_bytes": RawBytesTensorAdapter,
 }
 
 
@@ -37,4 +45,3 @@ def create_quantizer_adapter(
             f"{sorted(_REGISTRY)}"
         )
     return _REGISTRY[normalized](config)
-

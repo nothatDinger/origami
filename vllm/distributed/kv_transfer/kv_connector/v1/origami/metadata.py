@@ -61,6 +61,7 @@ class OrigamiRestoreRequest:
     block_ids_per_group: tuple[tuple[int, ...], ...]
     num_tokens: int
     lossless_path: LosslessPath = "cpu"
+    metric_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,4 +78,3 @@ class OrigamiConnectorMetadata(KVConnectorMetadata):
     reqs_to_restore: dict[str, OrigamiRestoreRequest] = field(default_factory=dict)
     reqs_to_save: dict[str, OrigamiSaveRequest] = field(default_factory=dict)
     gpu_lossless_ratio: int = 0
-

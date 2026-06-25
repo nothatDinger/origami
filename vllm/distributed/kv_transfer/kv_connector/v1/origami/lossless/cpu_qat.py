@@ -15,7 +15,9 @@ class CpuLosslessCodec:
     The QAT backend uses the lazy native QAT DP extension. It fails explicitly
     when QAT is unavailable unless zlib fallback is opted in. The zlib backend
     emits raw DEFLATE streams with the same bytestream contract and is intended
-    for tests and development only.
+    for tests and development only. The raw backend is an identity path used by
+    KIVI control experiments where packed KIVI bytes must not be losslessly
+    compressed.
     """
 
     def __init__(
@@ -34,10 +36,14 @@ class CpuLosslessCodec:
         self.qat_inflight = int(qat_inflight)
         self.qat_batch = int(qat_batch)
         self.qat_max_instances = int(qat_max_instances)
+        self.qat_codec_path = native_cpu.qat_codec_path()
         self._qat_error: str | None = None
         if backend == "qat":
             try:
-                native_cpu.load_qat_extension()
+                if self.qat_codec_path == "cpa":
+                    native_cpu.load_qat_cpa_extension()
+                else:
+                    native_cpu.load_qat_extension()
                 if not native_cpu.qat_available():
                     raise RuntimeError("no usable offloaded QAT DC instances found")
             except Exception as exc:
@@ -50,7 +56,7 @@ class CpuLosslessCodec:
                         f"{exc}"
                     ) from exc
                 self.backend = "zlib"
-        elif backend != "zlib":
+        elif backend not in {"zlib", "raw"}:
             raise ValueError(f"Unsupported Origami CPU lossless backend {backend!r}")
 
     @staticmethod
@@ -80,6 +86,8 @@ class CpuLosslessCodec:
         return torch.frombuffer(bytearray(decoded), dtype=torch.uint8).clone()
 
     def compress_many(self, chunks: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+        if self.backend == "raw":
+            return [self._cpu_u8(chunk) for chunk in chunks]
         if self.backend == "qat":
             return native_cpu.compress_raw_deflate_many(
                 chunks,
@@ -97,6 +105,17 @@ class CpuLosslessCodec:
     ) -> list[torch.Tensor]:
         if len(chunks) != len(output_bytes):
             raise ValueError("chunks and output_bytes must have the same length")
+        if self.backend == "raw":
+            restored = []
+            for chunk, out_bytes in zip(chunks, output_bytes):
+                flat = self._cpu_u8(chunk)
+                if int(flat.numel()) != int(out_bytes):
+                    raise RuntimeError(
+                        "Origami raw backend received "
+                        f"{int(flat.numel())} bytes, expected {int(out_bytes)}"
+                    )
+                restored.append(flat)
+            return restored
         if self.backend == "qat":
             return native_cpu.decompress_raw_deflate_many(
                 chunks,

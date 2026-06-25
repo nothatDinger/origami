@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -46,7 +47,10 @@ class OrigamiConnector(KVConnectorBase_V1, SupportsHMA):
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         self.config = OrigamiConfig.from_vllm_config(vllm_config)
-        self.store = create_origami_store(self.config.store_uri)
+        self.store = create_origami_store(
+            self.config.store_uri,
+            artifact_format=self.config.artifact_format,
+        )
         self.connector_scheduler: OrigamiConnectorScheduler | None = None
         self.connector_worker: OrigamiConnectorWorker | None = None
         if role == KVConnectorRole.SCHEDULER:
@@ -54,6 +58,20 @@ class OrigamiConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, self.config
             )
         elif role == KVConnectorRole.WORKER:
+            if (
+                self.config.artifact_ingress_mode == "memory"
+                and self.config.artifact_cache_keys
+            ):
+                self.store.preload_for_restore(
+                    list(self.config.artifact_cache_keys),
+                    lossless_backend=self.config.lossless_cpu_backend,
+                    metrics_path=(
+                        Path(self.config.metrics_dir) / "origami_metrics.jsonl"
+                        if self.config.metrics_dir
+                        else None
+                    ),
+                    system="origami",
+                )
             self.connector_worker = OrigamiConnectorWorker(
                 self.config, self.store, kv_cache_config
             )
@@ -157,4 +175,3 @@ class OrigamiConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.request_finished(request)
         return False, None
-

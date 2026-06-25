@@ -2,9 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import OrigamiConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import (
+    OrigamiConfig,
+    _parse_ratio,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.pipeline import (
     select_gpu_lossless_requests,
 )
@@ -27,11 +31,12 @@ class OrigamiOffloadController:
 
     def __init__(self, config: OrigamiConfig):
         self.config = config
-        if config.gpu_lossless_ratio == "auto":
+        ratio = _parse_ratio(config.gpu_lossless_ratio)
+        if ratio == "auto":
             self._level = 0
             self._auto = True
         else:
-            self._level = self.LEVELS.index(int(config.gpu_lossless_ratio))
+            self._level = self.LEVELS.index(int(ratio))
             self._auto = False
         self._high_steps = 0
         self._low_steps = 0
@@ -70,7 +75,14 @@ def _request_params(request: "Request") -> dict[str, Any]:
     return params if isinstance(params, dict) else {}
 
 
+def _is_save_prefill_request(request: "Request") -> bool:
+    params = _request_params(request)
+    return bool(params.get("origami_save_prefill"))
+
+
 def _is_resume_prefill_request(request: "Request") -> bool:
+    if _is_save_prefill_request(request):
+        return False
     params = _request_params(request)
     return bool(
         params.get("origami_resume_prefill")
@@ -88,6 +100,21 @@ def _cache_key(request: "Request") -> str:
     )
 
 
+def _metric_request_id(request: "Request") -> str:
+    params = _request_params(request)
+    return str(
+        params.get("origami_request_id")
+        or params.get("transfer_id")
+        or request.request_id
+    )
+
+
+@dataclass(frozen=True)
+class _SavePlan:
+    cache_key: str
+    token_start: int = 0
+    token_limit: int | None = None
+
 
 class OrigamiConnectorScheduler:
 
@@ -98,7 +125,7 @@ class OrigamiConnectorScheduler:
         self.controller = OrigamiOffloadController(config)
         self._restored_requests: set[str] = set()
         self._pending_restores: dict[str, OrigamiRestoreRequest] = {}
-        self._save_candidates: dict[str, tuple[str, int]] = {}
+        self._save_candidates: dict[str, _SavePlan] = {}
         self._last_observed_pcie_gbps = 0.0
 
     def observe_pcie_bandwidth_gbps(self, value: float) -> None:
@@ -110,21 +137,35 @@ class OrigamiConnectorScheduler:
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
         req_id = request.request_id
+        params = _request_params(request)
+        configured_tokens = params.get("origami_num_tokens")
+
+        if _is_save_prefill_request(request):
+            if configured_tokens is None:
+                tokens_to_save = int(request.num_tokens)
+            else:
+                tokens_to_save = max(0, min(int(configured_tokens), request.num_tokens))
+            if tokens_to_save > 0:
+                self._save_candidates[req_id] = _SavePlan(
+                    cache_key=_cache_key(request),
+                    token_start=0,
+                    token_limit=tokens_to_save,
+                )
+            return 0, False
+
         if req_id in self._restored_requests:
             return 0, False
         if not _is_resume_prefill_request(request):
             return 0, False
-        params = _request_params(request)
-        configured_tokens = params.get("origami_num_tokens")
         if configured_tokens is None:
             remaining = max(0, request.num_tokens - num_computed_tokens)
             matched = max(0, remaining - 1)
         else:
-            matched = max(0, min(int(configured_tokens), request.num_tokens))
+            target = max(0, min(int(configured_tokens), request.num_tokens))
+            matched = max(0, target - int(num_computed_tokens))
         if matched <= 0:
             return 0, False
-        self._save_candidates[req_id] = (_cache_key(request), matched)
-        return matched, False
+        return matched, True
 
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
@@ -146,6 +187,7 @@ class OrigamiConnectorScheduler:
             block_ids_per_group=block_ids_per_group,
             num_tokens=int(num_external_tokens),
             lossless_path="cpu",
+            metric_request_id=_metric_request_id(request),
         )
         self._restored_requests.add(req_id)
 
@@ -165,6 +207,7 @@ class OrigamiConnectorScheduler:
                 block_ids_per_group=restore.block_ids_per_group,
                 num_tokens=restore.num_tokens,
                 lossless_path="gpu" if req_id in gpu_request_ids else "cpu",
+                metric_request_id=restore.metric_request_id,
             )
 
         saves = self._build_save_metadata(scheduler_output)
@@ -184,17 +227,22 @@ class OrigamiConnectorScheduler:
         for new_req in scheduler_output.scheduled_new_reqs:
             req_id = new_req.req_id
             if req_id in self._save_candidates:
-                cache_key, restored_tokens = self._save_candidates[req_id]
+                plan = self._save_candidates[req_id]
                 scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                incremental_tokens = max(0, scheduled - restored_tokens)
+                incremental_tokens = max(0, scheduled - plan.token_start)
+                if plan.token_limit is not None:
+                    incremental_tokens = min(
+                        incremental_tokens,
+                        max(0, plan.token_limit - plan.token_start),
+                    )
                 if incremental_tokens <= 0:
                     continue
                 saves[req_id] = OrigamiSaveRequest(
                     request_id=req_id,
-                    cache_key=cache_key,
+                    cache_key=plan.cache_key,
                     block_ids_per_group=tuple(tuple(g) for g in new_req.block_ids),
                     num_tokens=incremental_tokens,
-                    token_start=restored_tokens,
+                    token_start=plan.token_start,
                 )
 
         cached = scheduler_output.scheduled_cached_reqs
@@ -205,15 +253,24 @@ class OrigamiConnectorScheduler:
             token_count = scheduler_output.num_scheduled_tokens.get(req_id, 0)
             if token_count <= 0:
                 continue
-            cache_key = self._save_candidates.get(req_id, (req_id, 0))[0]
+            plan = self._save_candidates.get(req_id)
+            if plan is None:
+                continue
+            token_start = (
+                int(cached.num_computed_tokens[index])
+                if index < len(cached.num_computed_tokens)
+                else 0
+            )
+            if plan is not None and plan.token_limit is not None:
+                token_count = min(token_count, max(0, plan.token_limit - token_start))
+                if token_count <= 0:
+                    continue
             saves[req_id] = OrigamiSaveRequest(
                 request_id=req_id,
-                cache_key=cache_key,
+                cache_key=plan.cache_key,
                 block_ids_per_group=tuple(tuple(g) for g in new_blocks),
                 num_tokens=int(token_count),
-                token_start=int(cached.num_computed_tokens[index])
-                if index < len(cached.num_computed_tokens)
-                else 0,
+                token_start=token_start,
             )
         return saves
 
@@ -221,4 +278,3 @@ class OrigamiConnectorScheduler:
         req_id = request.request_id
         self._restored_requests.discard(req_id)
         self._save_candidates.pop(req_id, None)
-

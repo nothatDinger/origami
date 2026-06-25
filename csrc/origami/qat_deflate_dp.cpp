@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cfloat>
 #include <condition_variable>
 #include <cstdint>
@@ -47,6 +48,88 @@ constexpr uint32_t kAlignment = 64;
 constexpr uint32_t kMaxQaeAllocBytes = 64U * 1024U * 1024U;
 constexpr uint32_t kMinDcDestBytes = 2048U;
 constexpr uint32_t kProjectWorkerCap = 4U;
+constexpr char kDpuCompDzMagic[8] = {'D', 'P', 'U', 'C', 'D', 'Z', '1', '\0'};
+
+uint64_t now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+double ns_to_ms(uint64_t ns) {
+  return static_cast<double>(ns) / 1.0e6;
+}
+
+struct QatDpProfile {
+  uint64_t total_ns = 0;
+  uint64_t worker_wall_ns_max = 0;
+  uint64_t slot_alloc_ns_sum = 0;
+  uint64_t enqueue_ns_sum = 0;
+  uint64_t poll_wait_ns_sum = 0;
+  uint64_t output_copy_ns_sum = 0;
+  uint64_t submit_poll_ns_critical = 0;
+  int64_t chunks = 0;
+  int64_t workers = 0;
+  int64_t inflight = 0;
+  int64_t batch = 0;
+  int64_t compressed_bytes = 0;
+  int64_t unpacked_bytes = 0;
+  bool persistent_workers = false;
+};
+
+struct QatPrepareProfile {
+  uint64_t total_ns = 0;
+  uint64_t parse_ns = 0;
+  uint64_t qat_state_ns = 0;
+  uint64_t qae_alloc_ns_sum = 0;
+  uint64_t qae_input_copy_ns_sum = 0;
+  uint64_t file_read_io_ns = 0;
+  uint64_t file_read_sleep_ns = 0;
+  uint64_t file_read_window_start_ns = 0;
+  int64_t file_read_bytes = 0;
+  int64_t qae_buffer_reuse_hits = 0;
+  int64_t qae_buffer_reuse_misses = 0;
+  int64_t chunks = 0;
+  int64_t workers = 0;
+  int64_t compressed_bytes = 0;
+  int64_t unpacked_bytes = 0;
+  int64_t bundle_bytes = 0;
+  bool dynamic_huffman = true;
+};
+
+struct WorkerProfile {
+  uint64_t wall_ns = 0;
+  uint64_t slot_alloc_ns = 0;
+  uint64_t enqueue_ns = 0;
+  uint64_t poll_wait_ns = 0;
+  uint64_t output_copy_ns = 0;
+};
+
+std::mutex& qat_profile_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+QatDpProfile& qat_last_profile() {
+  static QatDpProfile profile;
+  return profile;
+}
+
+void set_qat_last_profile(const QatDpProfile& profile) {
+  std::lock_guard<std::mutex> lock(qat_profile_mutex());
+  qat_last_profile() = profile;
+}
+
+QatPrepareProfile& qat_last_prepare_profile() {
+  static QatPrepareProfile profile;
+  return profile;
+}
+
+void set_qat_last_prepare_profile(const QatPrepareProfile& profile) {
+  std::lock_guard<std::mutex> lock(qat_profile_mutex());
+  qat_last_prepare_profile() = profile;
+}
 
 void check_cpu_u8(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(!tensor.is_cuda(), name, " must be a CPU tensor");
@@ -58,6 +141,12 @@ void check_cpu_i32(const torch::Tensor& tensor, const char* name) {
   TORCH_CHECK(!tensor.is_cuda(), name, " must be a CPU tensor");
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
   TORCH_CHECK(tensor.scalar_type() == torch::kInt32, name, " must be int32");
+}
+
+void check_cpu_i64(const torch::Tensor& tensor, const char* name) {
+  TORCH_CHECK(!tensor.is_cuda(), name, " must be a CPU tensor");
+  TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
+  TORCH_CHECK(tensor.scalar_type() == torch::kInt64, name, " must be int64");
 }
 
 void throw_qat(CpaStatus status, const char* what) {
@@ -77,6 +166,21 @@ CpaPhysicalAddr virt_to_phys(void* ptr) {
 
 uint64_t align_up(uint64_t value, uint64_t alignment) {
   return (value + alignment - 1U) & ~(alignment - 1U);
+}
+
+uint32_t load_u32_le(const uint8_t* p) {
+  return static_cast<uint32_t>(p[0]) |
+      (static_cast<uint32_t>(p[1]) << 8) |
+      (static_cast<uint32_t>(p[2]) << 16) |
+      (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint64_t load_u64_le(const uint8_t* p) {
+  uint64_t value = 0;
+  for (int idx = 7; idx >= 0; --idx) {
+    value = (value << 8) | static_cast<uint64_t>(p[idx]);
+  }
+  return value;
 }
 
 void cpu_relax() {
@@ -292,9 +396,14 @@ struct Slot {
   }
 };
 
+uint8_t* acquire_prepared_qae_buffer(int node, uint32_t capacity, bool* reused);
+void release_prepared_qae_buffer(uint8_t* ptr, uint32_t capacity, int node);
+
 struct PreparedChunk {
   uint8_t* data = nullptr;
   uint32_t data_capacity = 0;
+  int node = -1;
+  bool reused_from_pool = false;
   uint32_t input_len = 0;
   uint32_t output_len = 0;
   uint64_t output_offset = 0;
@@ -306,11 +415,15 @@ struct PreparedChunk {
   PreparedChunk(PreparedChunk&& other) noexcept
       : data(other.data),
         data_capacity(other.data_capacity),
+        node(other.node),
+        reused_from_pool(other.reused_from_pool),
         input_len(other.input_len),
         output_len(other.output_len),
         output_offset(other.output_offset) {
     other.data = nullptr;
     other.data_capacity = 0;
+    other.node = -1;
+    other.reused_from_pool = false;
     other.input_len = 0;
     other.output_len = 0;
     other.output_offset = 0;
@@ -321,11 +434,15 @@ struct PreparedChunk {
       reset();
       data = other.data;
       data_capacity = other.data_capacity;
+      node = other.node;
+      reused_from_pool = other.reused_from_pool;
       input_len = other.input_len;
       output_len = other.output_len;
       output_offset = other.output_offset;
       other.data = nullptr;
       other.data_capacity = 0;
+      other.node = -1;
+      other.reused_from_pool = false;
       other.input_len = 0;
       other.output_len = 0;
       other.output_offset = 0;
@@ -339,10 +456,12 @@ struct PreparedChunk {
 
   void reset() {
     if (data != nullptr) {
-      qaeMemFreeNUMA(reinterpret_cast<void**>(&data));
+      release_prepared_qae_buffer(data, data_capacity, node);
       data = nullptr;
     }
     data_capacity = 0;
+    node = -1;
+    reused_from_pool = false;
   }
 };
 
@@ -506,6 +625,98 @@ QatDpState& qat_state() {
   return state;
 }
 
+uint64_t prepared_qae_pool_max_bytes() {
+  const char* value = std::getenv("ORIGAMI_QAT_PREPARED_POOL_MAX_BYTES");
+  if (value == nullptr || *value == '\0') {
+    return 2ULL * 1024ULL * 1024ULL * 1024ULL;
+  }
+  try {
+    return static_cast<uint64_t>(std::stoull(value));
+  } catch (...) {
+    return 2ULL * 1024ULL * 1024ULL * 1024ULL;
+  }
+}
+
+class PreparedQaeBufferPool {
+ public:
+  PreparedQaeBufferPool() = default;
+  PreparedQaeBufferPool(const PreparedQaeBufferPool&) = delete;
+  PreparedQaeBufferPool& operator=(const PreparedQaeBufferPool&) = delete;
+
+  ~PreparedQaeBufferPool() {
+    for (auto& buffer : buffers_) {
+      if (buffer.ptr != nullptr) {
+        qaeMemFreeNUMA(reinterpret_cast<void**>(&buffer.ptr));
+      }
+    }
+  }
+
+  uint8_t* acquire(int node, uint32_t capacity, bool* reused) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = buffers_.begin(); it != buffers_.end(); ++it) {
+      if (it->node == node && it->capacity >= capacity) {
+        uint8_t* ptr = it->ptr;
+        pooled_bytes_ -= it->capacity;
+        buffers_.erase(it);
+        if (reused != nullptr) {
+          *reused = true;
+        }
+        return ptr;
+      }
+    }
+    if (reused != nullptr) {
+      *reused = false;
+    }
+    return nullptr;
+  }
+
+  void release(uint8_t* ptr, uint32_t capacity, int node) {
+    if (ptr == nullptr) {
+      return;
+    }
+    const uint64_t max_bytes = prepared_qae_pool_max_bytes();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (max_bytes == 0 || pooled_bytes_ + capacity > max_bytes) {
+      qaeMemFreeNUMA(reinterpret_cast<void**>(&ptr));
+      return;
+    }
+    buffers_.push_back(Buffer{ptr, capacity, node});
+    pooled_bytes_ += capacity;
+  }
+
+ private:
+  struct Buffer {
+    uint8_t* ptr = nullptr;
+    uint32_t capacity = 0;
+    int node = -1;
+  };
+
+  std::mutex mutex_;
+  std::vector<Buffer> buffers_;
+  uint64_t pooled_bytes_ = 0;
+};
+
+PreparedQaeBufferPool& prepared_qae_buffer_pool() {
+  static PreparedQaeBufferPool pool;
+  return pool;
+}
+
+uint8_t* acquire_prepared_qae_buffer(int node, uint32_t capacity, bool* reused) {
+  uint8_t* ptr = prepared_qae_buffer_pool().acquire(node, capacity, reused);
+  if (ptr != nullptr) {
+    return ptr;
+  }
+  ptr = static_cast<uint8_t*>(qaeMemAllocNUMA(capacity, node, kAlignment));
+  if (ptr == nullptr) {
+    throw std::runtime_error("failed to allocate prepared QAT chunk");
+  }
+  return ptr;
+}
+
+void release_prepared_qae_buffer(uint8_t* ptr, uint32_t capacity, int node) {
+  prepared_qae_buffer_pool().release(ptr, capacity, node);
+}
+
 uint32_t compressed_bound(QatCtx& ctx, uint32_t input_len, CpaDcHuffType huff_type) {
   Cpa32U bound = 0;
   const CpaStatus status =
@@ -544,13 +755,12 @@ void alloc_prepared_chunk(
   chunk.input_len = input_len;
   chunk.output_len = output_len;
   chunk.output_offset = output_offset;
+  chunk.node = ctx.node;
   chunk.data_capacity = static_cast<uint32_t>(
       align_up(std::max<uint32_t>(input_len, 1U), kAlignment));
-  chunk.data = static_cast<uint8_t*>(
-      qaeMemAllocNUMA(chunk.data_capacity, ctx.node, kAlignment));
-  if (chunk.data == nullptr) {
-    throw std::runtime_error("failed to allocate prepared QAT chunk");
-  }
+  bool reused = false;
+  chunk.data = acquire_prepared_qae_buffer(ctx.node, chunk.data_capacity, &reused);
+  chunk.reused_from_pool = reused;
 }
 
 void read_exact_fd(int fd, uint8_t* dst, uint32_t bytes) {
@@ -589,6 +799,47 @@ void pread_exact_fd(int fd, uint8_t* dst, uint32_t bytes, int64_t offset) {
     }
     done += static_cast<uint32_t>(n);
   }
+}
+
+void bandwidth_sleep(double bandwidth_gbps, QatPrepareProfile& profile) {
+  if (profile.file_read_bytes <= 0 || bandwidth_gbps <= 0.0) {
+    return;
+  }
+  const double bytes_per_second = bandwidth_gbps * 1.0e9 / 8.0;
+  if (bytes_per_second <= 0.0) {
+    return;
+  }
+  const uint64_t now = now_ns();
+  if (profile.file_read_window_start_ns == 0 || now <= profile.file_read_window_start_ns) {
+    return;
+  }
+  const uint64_t target_elapsed_ns = static_cast<uint64_t>(
+      (static_cast<double>(profile.file_read_bytes) / bytes_per_second) * 1.0e9);
+  const uint64_t elapsed_ns = now - profile.file_read_window_start_ns;
+  if (target_elapsed_ns <= elapsed_ns) {
+    return;
+  }
+  const uint64_t sleep_ns = target_elapsed_ns - elapsed_ns;
+  const uint64_t start_ns = now_ns();
+  std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+  profile.file_read_sleep_ns += now_ns() - start_ns;
+}
+
+void pread_exact_fd_profiled(
+    int fd,
+    uint8_t* dst,
+    uint32_t bytes,
+    int64_t offset,
+    double bandwidth_gbps,
+    QatPrepareProfile& profile) {
+  if (profile.file_read_window_start_ns == 0) {
+    profile.file_read_window_start_ns = now_ns();
+  }
+  const uint64_t read_start_ns = now_ns();
+  pread_exact_fd(fd, dst, bytes, offset);
+  profile.file_read_io_ns += now_ns() - read_start_ns;
+  profile.file_read_bytes += bytes;
+  bandwidth_sleep(bandwidth_gbps, profile);
 }
 
 void alloc_slot(QatCtx& ctx, Slot& slot, uint32_t dst_capacity) {
@@ -946,6 +1197,9 @@ void project_coeff_tile_to_matrix(
 }
 
 }  // namespace
+
+py::dict qat_deflate_last_profile_dp();
+py::dict qat_deflate_last_prepare_profile_dp();
 
 std::vector<torch::Tensor> qat_deflate_compress_dp(
     torch::Tensor input,
@@ -1387,6 +1641,11 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_dp(
     int64_t chunk_bytes,
     bool dynamic_huffman,
     int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
+  QatPrepareProfile profile;
+  profile.dynamic_huffman = dynamic_huffman;
+  profile.bundle_bytes = bytestream.numel();
+  uint64_t parse_start_ns = now_ns();
   check_cpu_u8(bytestream, "bytestream");
   check_cpu_i32(lengths, "lengths");
   TORCH_CHECK(lengths.dim() == 1, "lengths must be one-dimensional");
@@ -1396,8 +1655,14 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_dp(
   const int64_t chunks = lengths.numel();
   TORCH_CHECK(chunks == (output_bytes + chunk_bytes - 1) / chunk_bytes,
               "length count must match output_bytes and chunk_bytes");
+  profile.parse_ns += now_ns() - parse_start_ns;
+  const uint64_t state_start_ns = now_ns();
   auto& state = qat_state();
+  profile.qat_state_ns += now_ns() - state_start_ns;
   const uint32_t workers = worker_count_for(state.size(max_instances), max_instances, chunks);
+  profile.chunks = chunks;
+  profile.workers = workers;
+  profile.unpacked_bytes = output_bytes;
   const auto* input_ptr = bytestream.data_ptr<uint8_t>();
   const auto* lengths_ptr = lengths.data_ptr<int32_t>();
   int64_t input_offset = 0;
@@ -1407,6 +1672,7 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_dp(
   payload->chunk_bytes = chunk_bytes;
   payload->dynamic_huffman = dynamic_huffman;
   for (int64_t idx = 0; idx < chunks; ++idx) {
+    const uint64_t chunk_parse_start_ns = now_ns();
     const int32_t input_len_i32 = lengths_ptr[idx];
     TORCH_CHECK(input_len_i32 >= 0, "lengths must be non-negative");
     const uint32_t input_len = static_cast<uint32_t>(input_len_i32);
@@ -1419,24 +1685,33 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_dp(
         static_cast<uint32_t>(std::min<int64_t>(chunk_bytes, output_bytes - output_offset));
     QatCtx& ctx = state.ctx(static_cast<size_t>(idx % workers));
     PreparedChunk chunk;
-    chunk.input_len = input_len;
-    chunk.output_len = output_len;
-    chunk.output_offset = static_cast<uint64_t>(output_offset);
-    const uint32_t capacity = static_cast<uint32_t>(
-        align_up(std::max<uint32_t>(input_len, 1U), kAlignment));
-    chunk.data = static_cast<uint8_t*>(
-        qaeMemAllocNUMA(capacity, ctx.node, kAlignment));
-    if (chunk.data == nullptr) {
-      throw std::runtime_error("failed to allocate prepared QAT chunk");
+    profile.parse_ns += now_ns() - chunk_parse_start_ns;
+    const uint64_t alloc_start_ns = now_ns();
+    alloc_prepared_chunk(
+        ctx,
+        chunk,
+        input_len,
+        output_len,
+        static_cast<uint64_t>(output_offset));
+    profile.qae_alloc_ns_sum += now_ns() - alloc_start_ns;
+    if (chunk.reused_from_pool) {
+      profile.qae_buffer_reuse_hits += 1;
+    } else {
+      profile.qae_buffer_reuse_misses += 1;
     }
     if (input_len > 0) {
+      const uint64_t copy_start_ns = now_ns();
       std::memcpy(chunk.data, input_ptr + input_offset, input_len);
+      profile.qae_input_copy_ns_sum += now_ns() - copy_start_ns;
     }
     payload->compressed_bytes += input_len;
+    profile.compressed_bytes += input_len;
     input_offset += input_len;
     payload->chunks.push_back(std::move(chunk));
   }
   TORCH_CHECK(input_offset == bytestream.numel(), "lengths must sum to bytestream size");
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_prepare_profile(profile);
   return payload;
 }
 
@@ -1525,23 +1800,887 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_from_file_dp(
   }
 }
 
+std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_dp(
+    torch::Tensor bundle,
+    bool dynamic_huffman,
+    int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
+  QatPrepareProfile profile;
+  profile.dynamic_huffman = dynamic_huffman;
+  const uint64_t parse_start_ns = now_ns();
+  check_cpu_u8(bundle, "bundle");
+  TORCH_CHECK(bundle.dim() == 1, "bundle must be one-dimensional");
+  const int64_t bundle_bytes = bundle.numel();
+  profile.bundle_bytes = bundle_bytes;
+  TORCH_CHECK(bundle_bytes >= 24, "DPUCDZ1 bundle is too small");
+  const auto* data = bundle.data_ptr<uint8_t>();
+  TORCH_CHECK(
+      std::memcmp(data, kDpuCompDzMagic, sizeof(kDpuCompDzMagic)) == 0,
+      "invalid DPUCDZ1 bundle magic");
+
+  const uint32_t chunk_bytes = load_u32_le(data + 8);
+  const uint32_t chunk_count = load_u32_le(data + 12);
+  const uint64_t raw_bytes = load_u64_le(data + 16);
+  TORCH_CHECK(chunk_bytes > 0, "DPUCDZ1 chunk_bytes must be positive");
+  TORCH_CHECK(chunk_count > 0, "DPUCDZ1 chunk_count must be positive");
+  const uint64_t records_bytes = static_cast<uint64_t>(chunk_count) * 8ULL;
+  const uint64_t header_bytes = 24ULL + records_bytes;
+  TORCH_CHECK(header_bytes <= static_cast<uint64_t>(bundle_bytes),
+              "DPUCDZ1 record table exceeds bundle size");
+
+  struct DzRecord {
+    uint32_t raw_len = 0;
+    uint32_t comp_len = 0;
+    uint64_t comp_offset = 0;
+    uint64_t output_offset = 0;
+  };
+
+  std::vector<DzRecord> records;
+  records.reserve(chunk_count);
+  uint64_t raw_sum = 0;
+  uint64_t comp_sum = 0;
+  uint64_t cursor = 24;
+  for (uint32_t idx = 0; idx < chunk_count; ++idx) {
+    DzRecord record;
+    record.raw_len = load_u32_le(data + cursor);
+    record.comp_len = load_u32_le(data + cursor + 4);
+    record.comp_offset = comp_sum;
+    record.output_offset = raw_sum;
+    cursor += 8;
+    TORCH_CHECK(record.raw_len > 0 && record.raw_len <= chunk_bytes,
+                "invalid DPUCDZ1 raw chunk length");
+    TORCH_CHECK(record.comp_len > 0, "invalid DPUCDZ1 compressed chunk length");
+    TORCH_CHECK(record.comp_len < kMaxQaeAllocBytes,
+                "DPUCDZ1 prepared restore only supports compressed chunks below 64 MiB");
+    raw_sum += record.raw_len;
+    comp_sum += record.comp_len;
+    records.push_back(record);
+  }
+  TORCH_CHECK(raw_sum == raw_bytes, "DPUCDZ1 raw size mismatch");
+  TORCH_CHECK(header_bytes + comp_sum == static_cast<uint64_t>(bundle_bytes),
+              "DPUCDZ1 compressed payload size mismatch");
+  profile.parse_ns = now_ns() - parse_start_ns;
+  profile.chunks = chunk_count;
+  profile.compressed_bytes = static_cast<int64_t>(comp_sum);
+  profile.unpacked_bytes = static_cast<int64_t>(raw_bytes);
+
+  const uint64_t state_start_ns = now_ns();
+  auto& state = qat_state();
+  profile.qat_state_ns = now_ns() - state_start_ns;
+  const uint32_t workers =
+      worker_count_for(state.size(max_instances), max_instances, chunk_count);
+  profile.workers = workers;
+  auto payload = std::make_shared<QatPreparedPayload>();
+  payload->chunks.reserve(chunk_count);
+  payload->output_bytes = static_cast<int64_t>(raw_bytes);
+  payload->chunk_bytes = static_cast<int64_t>(chunk_bytes);
+  payload->compressed_bytes = static_cast<int64_t>(comp_sum);
+  payload->dynamic_huffman = dynamic_huffman;
+  const uint8_t* compressed_payload = data + header_bytes;
+  for (uint32_t idx = 0; idx < chunk_count; ++idx) {
+    const DzRecord& record = records[idx];
+    QatCtx& ctx = state.ctx(static_cast<size_t>(idx % workers));
+    PreparedChunk chunk;
+    const uint64_t alloc_start_ns = now_ns();
+    alloc_prepared_chunk(
+        ctx,
+        chunk,
+        record.comp_len,
+        record.raw_len,
+        record.output_offset);
+    profile.qae_alloc_ns_sum += now_ns() - alloc_start_ns;
+    if (chunk.reused_from_pool) {
+      profile.qae_buffer_reuse_hits += 1;
+    } else {
+      profile.qae_buffer_reuse_misses += 1;
+    }
+    const uint64_t copy_start_ns = now_ns();
+    std::memcpy(
+        chunk.data,
+        compressed_payload + record.comp_offset,
+        record.comp_len);
+    profile.qae_input_copy_ns_sum += now_ns() - copy_start_ns;
+    payload->chunks.push_back(std::move(chunk));
+  }
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_prepare_profile(profile);
+  return payload;
+}
+
+std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_from_file_dp(
+    std::string path,
+    bool dynamic_huffman,
+    int64_t max_instances,
+    double bandwidth_gbps,
+    int64_t file_offset) {
+  const uint64_t total_start_ns = now_ns();
+  QatPrepareProfile profile;
+  profile.dynamic_huffman = dynamic_huffman;
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    throw std::runtime_error("open failed with errno " + std::to_string(errno));
+  }
+  try {
+    uint8_t header[24];
+    pread_exact_fd_profiled(
+        fd,
+        header,
+        static_cast<uint32_t>(sizeof(header)),
+        file_offset,
+        bandwidth_gbps,
+        profile);
+
+    uint64_t parse_start_ns = now_ns();
+    TORCH_CHECK(
+        std::memcmp(header, kDpuCompDzMagic, sizeof(kDpuCompDzMagic)) == 0,
+        "invalid DPUCDZ1 bundle magic");
+    const uint32_t chunk_bytes = load_u32_le(header + 8);
+    const uint32_t chunk_count = load_u32_le(header + 12);
+    const uint64_t raw_bytes = load_u64_le(header + 16);
+    TORCH_CHECK(chunk_bytes > 0, "DPUCDZ1 chunk_bytes must be positive");
+    TORCH_CHECK(chunk_count > 0, "DPUCDZ1 chunk_count must be positive");
+    const uint64_t records_bytes = static_cast<uint64_t>(chunk_count) * 8ULL;
+    const uint64_t header_bytes = 24ULL + records_bytes;
+    TORCH_CHECK(records_bytes <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
+                "DPUCDZ1 record table too large");
+    profile.parse_ns += now_ns() - parse_start_ns;
+
+    std::vector<uint8_t> record_bytes(static_cast<size_t>(records_bytes));
+    pread_exact_fd_profiled(
+        fd,
+        record_bytes.data(),
+        static_cast<uint32_t>(record_bytes.size()),
+        file_offset + 24,
+        bandwidth_gbps,
+        profile);
+
+    struct DzRecord {
+      uint32_t raw_len = 0;
+      uint32_t comp_len = 0;
+      uint64_t comp_offset = 0;
+      uint64_t output_offset = 0;
+    };
+
+    parse_start_ns = now_ns();
+    std::vector<DzRecord> records;
+    records.reserve(chunk_count);
+    uint64_t raw_sum = 0;
+    uint64_t comp_sum = 0;
+    uint64_t cursor = 0;
+    const uint8_t* records_data = record_bytes.data();
+    for (uint32_t idx = 0; idx < chunk_count; ++idx) {
+      DzRecord record;
+      record.raw_len = load_u32_le(records_data + cursor);
+      record.comp_len = load_u32_le(records_data + cursor + 4);
+      record.comp_offset = comp_sum;
+      record.output_offset = raw_sum;
+      cursor += 8;
+      TORCH_CHECK(record.raw_len > 0 && record.raw_len <= chunk_bytes,
+                  "invalid DPUCDZ1 raw chunk length");
+      TORCH_CHECK(record.comp_len > 0, "invalid DPUCDZ1 compressed chunk length");
+      TORCH_CHECK(record.comp_len < kMaxQaeAllocBytes,
+                  "DPUCDZ1 prepared restore only supports compressed chunks below 64 MiB");
+      raw_sum += record.raw_len;
+      comp_sum += record.comp_len;
+      records.push_back(record);
+    }
+    TORCH_CHECK(raw_sum == raw_bytes, "DPUCDZ1 raw size mismatch");
+    profile.parse_ns += now_ns() - parse_start_ns;
+    profile.chunks = chunk_count;
+    profile.compressed_bytes = static_cast<int64_t>(comp_sum);
+    profile.unpacked_bytes = static_cast<int64_t>(raw_bytes);
+    profile.bundle_bytes = static_cast<int64_t>(header_bytes + comp_sum);
+
+    const uint64_t state_start_ns = now_ns();
+    auto& state = qat_state();
+    profile.qat_state_ns = now_ns() - state_start_ns;
+    const uint32_t workers =
+        worker_count_for(state.size(max_instances), max_instances, chunk_count);
+    profile.workers = workers;
+    auto payload = std::make_shared<QatPreparedPayload>();
+    payload->chunks.reserve(chunk_count);
+    payload->output_bytes = static_cast<int64_t>(raw_bytes);
+    payload->chunk_bytes = static_cast<int64_t>(chunk_bytes);
+    payload->compressed_bytes = static_cast<int64_t>(comp_sum);
+    payload->dynamic_huffman = dynamic_huffman;
+    for (uint32_t idx = 0; idx < chunk_count; ++idx) {
+      const DzRecord& record = records[idx];
+      QatCtx& ctx = state.ctx(static_cast<size_t>(idx % workers));
+      PreparedChunk chunk;
+      const uint64_t alloc_start_ns = now_ns();
+      alloc_prepared_chunk(
+          ctx,
+          chunk,
+          record.comp_len,
+          record.raw_len,
+          record.output_offset);
+      profile.qae_alloc_ns_sum += now_ns() - alloc_start_ns;
+      if (chunk.reused_from_pool) {
+        profile.qae_buffer_reuse_hits += 1;
+      } else {
+        profile.qae_buffer_reuse_misses += 1;
+      }
+      pread_exact_fd_profiled(
+          fd,
+          chunk.data,
+          record.comp_len,
+          file_offset + static_cast<int64_t>(header_bytes + record.comp_offset),
+          bandwidth_gbps,
+          profile);
+      payload->chunks.push_back(std::move(chunk));
+    }
+    ::close(fd);
+    profile.total_ns = now_ns() - total_start_ns;
+    set_qat_last_prepare_profile(profile);
+    return payload;
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+}
+
+struct PersistentRestoreJob {
+  std::shared_ptr<QatPreparedPayload> payload;
+  uint8_t* output_ptr = nullptr;
+  int64_t inflight = 0;
+  int64_t batch_size = 0;
+  int64_t max_instances = 0;
+  const std::vector<int64_t>* chunk_indices = nullptr;
+  const std::vector<uint64_t>* output_offsets = nullptr;
+  int64_t window_output_bytes = -1;
+  int64_t window_compressed_bytes = -1;
+  uint32_t active_workers = 0;
+  uint32_t total_workers = 0;
+  std::vector<WorkerProfile>* profiles = nullptr;
+  std::vector<std::exception_ptr>* errors = nullptr;
+  uint32_t finished_workers = 0;
+};
+
+uint64_t persistent_job_chunk_count(const PersistentRestoreJob& job) {
+  if (job.chunk_indices != nullptr) {
+    return static_cast<uint64_t>(job.chunk_indices->size());
+  }
+  return static_cast<uint64_t>(job.payload->chunks.size());
+}
+
+uint64_t persistent_job_global_chunk_index(
+    const PersistentRestoreJob& job,
+    uint64_t local_chunk_idx) {
+  if (job.chunk_indices == nullptr) {
+    return local_chunk_idx;
+  }
+  return static_cast<uint64_t>((*job.chunk_indices)[local_chunk_idx]);
+}
+
+const PreparedChunk& persistent_job_chunk(
+    const PersistentRestoreJob& job,
+    uint64_t local_chunk_idx) {
+  const uint64_t global_idx =
+      persistent_job_global_chunk_index(job, local_chunk_idx);
+  TORCH_CHECK(global_idx < job.payload->chunks.size(),
+              "prepared window chunk index out of range");
+  return job.payload->chunks[global_idx];
+}
+
+uint64_t persistent_job_output_offset(
+    const PersistentRestoreJob& job,
+    uint64_t local_chunk_idx) {
+  if (job.output_offsets == nullptr) {
+    return persistent_job_chunk(job, local_chunk_idx).output_offset;
+  }
+  return (*job.output_offsets)[local_chunk_idx];
+}
+
+struct PersistentWorkerState {
+  std::vector<std::unique_ptr<Slot>> slots;
+};
+
+class PersistentPreparedRestoreExecutor {
+ public:
+  PersistentPreparedRestoreExecutor() = default;
+  PersistentPreparedRestoreExecutor(const PersistentPreparedRestoreExecutor&) = delete;
+  PersistentPreparedRestoreExecutor& operator=(const PersistentPreparedRestoreExecutor&) = delete;
+
+  ~PersistentPreparedRestoreExecutor() {
+    stop();
+  }
+
+  QatDpProfile run(
+      std::shared_ptr<QatPreparedPayload> payload,
+      uint8_t* output_ptr,
+      int64_t inflight,
+      int64_t batch_size,
+      int64_t max_instances,
+      const std::vector<int64_t>* chunk_indices = nullptr,
+      const std::vector<uint64_t>* output_offsets = nullptr,
+      int64_t window_output_bytes = -1,
+      int64_t window_compressed_bytes = -1) {
+    TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+    const uint64_t chunk_count =
+        chunk_indices != nullptr
+            ? static_cast<uint64_t>(chunk_indices->size())
+            : static_cast<uint64_t>(payload->chunks.size());
+    const int64_t effective_output_bytes =
+        window_output_bytes >= 0 ? window_output_bytes : payload->output_bytes;
+    const int64_t effective_compressed_bytes =
+        window_compressed_bytes >= 0
+            ? window_compressed_bytes
+            : payload->compressed_bytes;
+    TORCH_CHECK(output_ptr != nullptr || effective_output_bytes == 0,
+                "prepared restore output pointer must not be null");
+    auto& state = qat_state();
+    const uint32_t total_workers =
+        static_cast<uint32_t>(state.size(0));
+    const uint32_t active_workers =
+        worker_count_for(state.size(max_instances), max_instances, chunk_count);
+    ensure_started(total_workers);
+
+    std::vector<WorkerProfile> profiles(total_workers);
+    std::vector<std::exception_ptr> errors(total_workers);
+    PersistentRestoreJob job;
+    job.payload = std::move(payload);
+    job.output_ptr = output_ptr;
+    job.inflight = inflight;
+    job.batch_size = batch_size;
+    job.max_instances = max_instances;
+    job.chunk_indices = chunk_indices;
+    job.output_offsets = output_offsets;
+    job.window_output_bytes = effective_output_bytes;
+    job.window_compressed_bytes = effective_compressed_bytes;
+    job.active_workers = active_workers;
+    job.total_workers = total_workers;
+    job.profiles = &profiles;
+    job.errors = &errors;
+
+    const uint64_t total_start_ns = now_ns();
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      idle_cv_.wait(lock, [&]() { return current_job_ == nullptr; });
+      current_job_ = &job;
+      job_generation_++;
+      job_cv_.notify_all();
+      done_cv_.wait(lock, [&]() {
+        return job.finished_workers >= total_workers;
+      });
+      current_job_ = nullptr;
+      idle_cv_.notify_all();
+    }
+    for (const auto& error : errors) {
+      if (error) {
+        std::rethrow_exception(error);
+      }
+    }
+
+    QatDpProfile profile;
+    profile.total_ns = now_ns() - total_start_ns;
+    profile.chunks = static_cast<int64_t>(chunk_count);
+    profile.workers = static_cast<int64_t>(active_workers);
+    profile.inflight = inflight;
+    profile.batch = batch_size;
+    profile.compressed_bytes = effective_compressed_bytes;
+    profile.unpacked_bytes = effective_output_bytes;
+    profile.persistent_workers = true;
+    for (uint32_t worker = 0; worker < active_workers; ++worker) {
+      const WorkerProfile& worker_profile = profiles[worker];
+      profile.worker_wall_ns_max =
+          std::max(profile.worker_wall_ns_max, worker_profile.wall_ns);
+      profile.slot_alloc_ns_sum += worker_profile.slot_alloc_ns;
+      profile.enqueue_ns_sum += worker_profile.enqueue_ns;
+      profile.poll_wait_ns_sum += worker_profile.poll_wait_ns;
+      profile.output_copy_ns_sum += worker_profile.output_copy_ns;
+      profile.submit_poll_ns_critical = std::max(
+          profile.submit_poll_ns_critical,
+          worker_profile.enqueue_ns + worker_profile.poll_wait_ns);
+    }
+    return profile;
+  }
+
+ private:
+  void ensure_started(uint32_t worker_count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!threads_.empty()) {
+      TORCH_CHECK(threads_.size() == worker_count,
+                  "QAT worker count changed after persistent executor startup");
+      return;
+    }
+    worker_states_.resize(worker_count);
+    for (uint32_t worker = 0; worker < worker_count; ++worker) {
+      threads_.emplace_back([this, worker]() { worker_loop(worker); });
+    }
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+      job_cv_.notify_all();
+    }
+    for (auto& thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+    threads_.clear();
+    worker_states_.clear();
+  }
+
+  void ensure_slots(
+      QatCtx& ctx,
+      PersistentWorkerState& state,
+      uint32_t slot_count,
+      uint32_t dst_capacity,
+      WorkerProfile& profile) {
+    bool reuse = state.slots.size() >= slot_count;
+    if (reuse) {
+      const uint32_t required_capacity =
+          static_cast<uint32_t>(align_up(std::max(dst_capacity, kMinDcDestBytes), kAlignment));
+      for (uint32_t idx = 0; idx < slot_count; ++idx) {
+        const Slot& slot = *state.slots[idx];
+        if (slot.op == nullptr || slot.dst_capacity < required_capacity) {
+          reuse = false;
+          break;
+        }
+      }
+    }
+    if (reuse) {
+      return;
+    }
+
+    const uint64_t alloc_start_ns = now_ns();
+    state.slots.clear();
+    state.slots.reserve(slot_count);
+    for (uint32_t idx = 0; idx < slot_count; ++idx) {
+      auto slot = std::make_unique<Slot>();
+      alloc_slot(ctx, *slot, dst_capacity);
+      state.slots.push_back(std::move(slot));
+    }
+    profile.slot_alloc_ns += now_ns() - alloc_start_ns;
+  }
+
+  void worker_loop(uint32_t worker) {
+    uint64_t seen_generation = 0;
+    try {
+      QatCtx& ctx = qat_state().ctx(worker);
+      pin_qat_worker_thread(worker, ctx.node);
+      while (true) {
+        PersistentRestoreJob* job = nullptr;
+        uint64_t generation = 0;
+        {
+          std::unique_lock<std::mutex> lock(mutex_);
+          job_cv_.wait(lock, [&]() {
+            return stopping_ || job_generation_ != seen_generation;
+          });
+          if (stopping_) {
+            return;
+          }
+          job = current_job_;
+          generation = job_generation_;
+        }
+        if (job != nullptr) {
+          if (worker < job->active_workers) {
+            run_worker(ctx, worker, *job);
+          }
+          {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job->finished_workers++;
+            if (job->finished_workers >= job->total_workers) {
+              done_cv_.notify_one();
+            }
+          }
+        }
+        seen_generation = generation;
+      }
+    } catch (...) {
+      // A worker-level setup failure is surfaced through the next job slot.
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (current_job_ != nullptr && current_job_->errors != nullptr &&
+          worker < current_job_->errors->size()) {
+        (*current_job_->errors)[worker] = std::current_exception();
+        current_job_->finished_workers++;
+        if (current_job_->finished_workers >= current_job_->total_workers) {
+          done_cv_.notify_one();
+        }
+      }
+    }
+  }
+
+  void run_worker(QatCtx& ctx, uint32_t worker, PersistentRestoreJob& job) {
+    WorkerProfile& profile = (*job.profiles)[worker];
+    const uint64_t worker_start_ns = now_ns();
+    try {
+      const CpaDcSessionHandle session =
+          job.payload->dynamic_huffman ? ctx.session_dynamic : ctx.session_static;
+      std::vector<uint64_t> worker_chunks;
+      for (uint64_t ordinal = 0;; ++ordinal) {
+        const uint64_t chunk_idx =
+            worker_chunk_index(worker, job.active_workers, ordinal);
+        if (chunk_idx >= persistent_job_chunk_count(job)) {
+          break;
+        }
+        worker_chunks.push_back(chunk_idx);
+      }
+      const uint32_t slot_count = static_cast<uint32_t>(
+          std::min<int64_t>(job.inflight, std::max<int64_t>(1, worker_chunks.size())));
+      const uint32_t dst_capacity = static_cast<uint32_t>(
+          std::min<int64_t>(job.payload->chunk_bytes, job.payload->output_bytes));
+      ensure_slots(ctx, worker_states_[worker], slot_count, dst_capacity, profile);
+
+      std::vector<CpaDcDpOpData*> batch;
+      batch.reserve(static_cast<size_t>(job.batch_size));
+      uint64_t submitted = 0;
+      uint64_t completed = 0;
+      uint64_t next = 0;
+      auto& slots = worker_states_[worker].slots;
+      while (true) {
+        while (submitted - completed >= slot_count) {
+          Slot& slot = *slots[completed % slot_count];
+          const uint64_t poll_start_ns = now_ns();
+          poll_until_done(ctx, slot);
+          profile.poll_wait_ns += now_ns() - poll_start_ns;
+          const PreparedChunk& chunk = persistent_job_chunk(job, slot.chunk_index);
+          const uint64_t copy_start_ns = now_ns();
+          copy_slot_output_to_tensor(
+              slot,
+              job.output_ptr,
+              persistent_job_output_offset(job, slot.chunk_index),
+              chunk.output_len);
+          profile.output_copy_ns += now_ns() - copy_start_ns;
+          completed++;
+        }
+        batch.clear();
+        while (batch.size() < static_cast<size_t>(job.batch_size) &&
+               submitted - completed + batch.size() < slot_count &&
+               next < worker_chunks.size()) {
+          Slot& slot = *slots[(submitted + batch.size()) % slot_count];
+          slot.chunk_index = worker_chunks[next];
+          prepare_slot_from_prepared_chunk(
+              ctx,
+              slot,
+              persistent_job_chunk(job, slot.chunk_index),
+              session,
+              CPA_DC_DIR_DECOMPRESS);
+          batch.push_back(slot.op);
+          next++;
+        }
+        if (batch.empty()) {
+          break;
+        }
+        const uint64_t enqueue_start_ns = now_ns();
+        submit_batch(ctx, batch);
+        profile.enqueue_ns += now_ns() - enqueue_start_ns;
+        submitted += batch.size();
+      }
+      while (completed < submitted) {
+        Slot& slot = *slots[completed % slot_count];
+        const uint64_t poll_start_ns = now_ns();
+        poll_until_done(ctx, slot);
+        profile.poll_wait_ns += now_ns() - poll_start_ns;
+        const PreparedChunk& chunk = persistent_job_chunk(job, slot.chunk_index);
+        const uint64_t copy_start_ns = now_ns();
+        copy_slot_output_to_tensor(
+            slot,
+            job.output_ptr,
+            persistent_job_output_offset(job, slot.chunk_index),
+            chunk.output_len);
+        profile.output_copy_ns += now_ns() - copy_start_ns;
+        completed++;
+      }
+    } catch (...) {
+      (*job.errors)[worker] = std::current_exception();
+    }
+    profile.wall_ns = now_ns() - worker_start_ns;
+  }
+
+  std::mutex mutex_;
+  std::condition_variable job_cv_;
+  std::condition_variable done_cv_;
+  std::condition_variable idle_cv_;
+  bool stopping_ = false;
+  uint64_t job_generation_ = 0;
+  PersistentRestoreJob* current_job_ = nullptr;
+  std::vector<std::thread> threads_;
+  std::vector<PersistentWorkerState> worker_states_;
+};
+
+PersistentPreparedRestoreExecutor& persistent_restore_executor() {
+  static PersistentPreparedRestoreExecutor executor;
+  return executor;
+}
+
+QatDpProfile run_persistent_prepared_decompress(
+    std::shared_ptr<QatPreparedPayload> payload,
+    uint8_t* output_ptr,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances,
+    const std::vector<int64_t>* chunk_indices = nullptr,
+    const std::vector<uint64_t>* output_offsets = nullptr,
+    int64_t window_output_bytes = -1,
+    int64_t window_compressed_bytes = -1) {
+  (void)qat_state();
+  return persistent_restore_executor().run(
+      std::move(payload),
+      output_ptr,
+      inflight,
+      batch_size,
+      max_instances,
+      chunk_indices,
+      output_offsets,
+      window_output_bytes,
+      window_compressed_bytes);
+}
+
+std::vector<int64_t> prepared_window_indices(torch::Tensor indices) {
+  check_cpu_i64(indices, "indices");
+  TORCH_CHECK(indices.dim() == 1, "indices must be one-dimensional");
+  const auto* ptr = indices.data_ptr<int64_t>();
+  std::vector<int64_t> out(static_cast<size_t>(indices.numel()));
+  for (int64_t idx = 0; idx < indices.numel(); ++idx) {
+    out[static_cast<size_t>(idx)] = ptr[idx];
+  }
+  return out;
+}
+
+void prepared_window_offsets(
+    const QatPreparedPayload& payload,
+    const std::vector<int64_t>& indices,
+    std::vector<uint64_t>& offsets,
+    int64_t& output_bytes,
+    int64_t& compressed_bytes) {
+  offsets.clear();
+  offsets.reserve(indices.size());
+  output_bytes = 0;
+  compressed_bytes = 0;
+  for (const int64_t index : indices) {
+    TORCH_CHECK(index >= 0 &&
+                    static_cast<uint64_t>(index) < payload.chunks.size(),
+                "prepared window chunk index out of range");
+    const PreparedChunk& chunk =
+        payload.chunks[static_cast<size_t>(index)];
+    offsets.push_back(static_cast<uint64_t>(output_bytes));
+    output_bytes += static_cast<int64_t>(chunk.output_len);
+    compressed_bytes += static_cast<int64_t>(chunk.input_len);
+  }
+}
+
 torch::Tensor qat_deflate_decompress_prepared_dp(
     std::shared_ptr<QatPreparedPayload> payload,
     int64_t inflight,
     int64_t batch_size,
     int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
   TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
   TORCH_CHECK(inflight > 0 && batch_size > 0, "inflight and batch_size must be positive");
   if (payload->chunks.empty()) {
+    QatDpProfile profile;
+    profile.total_ns = now_ns() - total_start_ns;
+    profile.chunks = 0;
+    profile.workers = 0;
+    profile.inflight = inflight;
+    profile.batch = batch_size;
+    profile.compressed_bytes = payload->compressed_bytes;
+    profile.unpacked_bytes = payload->output_bytes;
+    set_qat_last_profile(profile);
     return torch::empty({payload->output_bytes}, torch::dtype(torch::kUInt8));
   }
+  auto output = torch::empty({payload->output_bytes}, torch::dtype(torch::kUInt8));
+  auto* output_ptr = output.data_ptr<uint8_t>();
+  QatDpProfile profile = run_persistent_prepared_decompress(
+      payload, output_ptr, inflight, batch_size, max_instances);
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_profile(profile);
+  return output;
+}
+
+torch::Tensor qat_deflate_decompress_prepared_into_dp(
+    std::shared_ptr<QatPreparedPayload> payload,
+    torch::Tensor output,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
+  TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+  check_cpu_u8(output, "output");
+  TORCH_CHECK(output.dim() == 1, "output must be one-dimensional");
+  TORCH_CHECK(output.numel() == payload->output_bytes,
+              "output byte size must match prepared payload");
+  QatDpProfile profile = run_persistent_prepared_decompress(
+      payload, output.data_ptr<uint8_t>(), inflight, batch_size, max_instances);
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_profile(profile);
+  return output;
+}
+
+py::dict qat_dp_profile_to_dict(const QatDpProfile& profile) {
+  const uint64_t thread_gap_ns =
+      profile.total_ns > profile.worker_wall_ns_max
+          ? profile.total_ns - profile.worker_wall_ns_max
+          : 0;
+  py::dict out;
+  out["total_ms"] = ns_to_ms(profile.total_ns);
+  out["worker_wall_ms_max"] = ns_to_ms(profile.worker_wall_ns_max);
+  out["thread_launch_join_ms"] = ns_to_ms(thread_gap_ns);
+  out["slot_alloc_ms_sum"] = ns_to_ms(profile.slot_alloc_ns_sum);
+  out["qat_enqueue_ms_sum"] = ns_to_ms(profile.enqueue_ns_sum);
+  out["qat_poll_wait_ms_sum"] = ns_to_ms(profile.poll_wait_ns_sum);
+  out["qat_submit_poll_ms_sum"] =
+      ns_to_ms(profile.enqueue_ns_sum + profile.poll_wait_ns_sum);
+  out["qat_submit_poll_ms_critical"] = ns_to_ms(profile.submit_poll_ns_critical);
+  out["qae_output_copy_ms_sum"] = ns_to_ms(profile.output_copy_ns_sum);
+  out["chunks"] = profile.chunks;
+  out["workers"] = profile.workers;
+  out["inflight"] = profile.inflight;
+  out["batch"] = profile.batch;
+  out["compressed_bytes"] = profile.compressed_bytes;
+  out["unpacked_bytes"] = profile.unpacked_bytes;
+  out["persistent_workers"] = profile.persistent_workers;
+  out["compressed_gbps_qat_critical"] =
+      profile.submit_poll_ns_critical > 0
+          ? static_cast<double>(profile.compressed_bytes) * 8.0 /
+                static_cast<double>(profile.submit_poll_ns_critical)
+          : 0.0;
+  out["unpacked_gbps_qat_critical"] =
+      profile.submit_poll_ns_critical > 0
+          ? static_cast<double>(profile.unpacked_bytes) * 8.0 /
+                static_cast<double>(profile.submit_poll_ns_critical)
+          : 0.0;
+  return out;
+}
+
+torch::Tensor qat_deflate_decompress_prepared_window_into_dp(
+    std::shared_ptr<QatPreparedPayload> payload,
+    torch::Tensor indices,
+    torch::Tensor output,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
+  TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+  TORCH_CHECK(inflight > 0 && batch_size > 0, "inflight and batch_size must be positive");
+  check_cpu_u8(output, "output");
+  TORCH_CHECK(output.dim() == 1, "output must be one-dimensional");
+  std::vector<int64_t> window_indices = prepared_window_indices(indices);
+  std::vector<uint64_t> output_offsets;
+  int64_t output_bytes = 0;
+  int64_t compressed_bytes = 0;
+  prepared_window_offsets(
+      *payload, window_indices, output_offsets, output_bytes, compressed_bytes);
+  TORCH_CHECK(output.numel() == output_bytes,
+              "output byte size must match prepared window");
+  QatDpProfile profile = run_persistent_prepared_decompress(
+      payload,
+      output.data_ptr<uint8_t>(),
+      inflight,
+      batch_size,
+      max_instances,
+      &window_indices,
+      &output_offsets,
+      output_bytes,
+      compressed_bytes);
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_profile(profile);
+  return output;
+}
+
+py::tuple qat_deflate_decompress_prepared_window_with_profile_into_dp(
+    std::shared_ptr<QatPreparedPayload> payload,
+    torch::Tensor indices,
+    torch::Tensor output,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances) {
+  const uint64_t total_start_ns = now_ns();
+  TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+  TORCH_CHECK(inflight > 0 && batch_size > 0, "inflight and batch_size must be positive");
+  check_cpu_u8(output, "output");
+  TORCH_CHECK(output.dim() == 1, "output must be one-dimensional");
+  std::vector<int64_t> window_indices = prepared_window_indices(indices);
+  std::vector<uint64_t> output_offsets;
+  int64_t output_bytes = 0;
+  int64_t compressed_bytes = 0;
+  prepared_window_offsets(
+      *payload, window_indices, output_offsets, output_bytes, compressed_bytes);
+  TORCH_CHECK(output.numel() == output_bytes,
+              "output byte size must match prepared window");
+  QatDpProfile profile;
+  {
+    py::gil_scoped_release release;
+    profile = run_persistent_prepared_decompress(
+        payload,
+        output.data_ptr<uint8_t>(),
+        inflight,
+        batch_size,
+        max_instances,
+        &window_indices,
+        &output_offsets,
+        output_bytes,
+        compressed_bytes);
+  }
+  profile.total_ns = now_ns() - total_start_ns;
+  set_qat_last_profile(profile);
+  return py::make_tuple(output, qat_dp_profile_to_dict(profile));
+}
+
+torch::Tensor qat_deflate_decompress_prepared_window_dp(
+    std::shared_ptr<QatPreparedPayload> payload,
+    torch::Tensor indices,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances) {
+  TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+  std::vector<int64_t> window_indices = prepared_window_indices(indices);
+  std::vector<uint64_t> output_offsets;
+  int64_t output_bytes = 0;
+  int64_t compressed_bytes = 0;
+  prepared_window_offsets(
+      *payload, window_indices, output_offsets, output_bytes, compressed_bytes);
+  auto output = torch::empty({output_bytes}, torch::dtype(torch::kUInt8));
+  return qat_deflate_decompress_prepared_window_into_dp(
+      std::move(payload),
+      indices,
+      output,
+      inflight,
+      batch_size,
+      max_instances);
+}
+
+py::dict qat_deflate_profile_prepared_window_dp(
+    std::shared_ptr<QatPreparedPayload> payload,
+    int64_t inflight,
+    int64_t batch_size,
+    int64_t max_instances,
+    int64_t loops) {
+  TORCH_CHECK(payload != nullptr, "prepared payload must not be null");
+  TORCH_CHECK(inflight > 0 && batch_size > 0, "inflight and batch_size must be positive");
+  TORCH_CHECK(loops > 0, "loops must be positive");
   auto& state = qat_state();
   const uint32_t workers =
       worker_count_for(state.size(max_instances), max_instances, payload->chunks.size());
-  auto output = torch::empty({payload->output_bytes}, torch::dtype(torch::kUInt8));
-  auto* output_ptr = output.data_ptr<uint8_t>();
+  if (payload->chunks.empty()) {
+    py::dict out;
+    out["api"] = "qat_dp_window_batch_no_copy";
+    out["total_ms"] = 0.0;
+    out["worker_wall_ms_max"] = 0.0;
+    out["slot_alloc_ms_sum"] = 0.0;
+    out["qat_enqueue_ms_sum"] = 0.0;
+    out["qat_poll_wait_ms_sum"] = 0.0;
+    out["chunks"] = 0;
+    out["workers"] = 0;
+    out["loops"] = loops;
+    out["compressed_bytes"] = payload->compressed_bytes;
+    out["unpacked_bytes"] = payload->output_bytes;
+    out["compressed_gbps_worker"] = 0.0;
+    out["unpacked_gbps_worker"] = 0.0;
+    return out;
+  }
+
   std::vector<std::thread> threads;
   std::vector<std::exception_ptr> errors(workers);
+  std::vector<WorkerProfile> worker_profiles(workers);
+  std::mutex barrier_mutex;
+  std::condition_variable barrier_cv;
+  uint32_t ready_workers = 0;
+  bool start_workers = false;
 
   for (uint32_t worker = 0; worker < workers; ++worker) {
     threads.emplace_back([&, worker]() {
@@ -1564,67 +2703,130 @@ torch::Tensor qat_deflate_decompress_prepared_dp(
         slots.reserve(slot_count);
         const uint32_t dst_capacity = static_cast<uint32_t>(
             std::min<int64_t>(payload->chunk_bytes, payload->output_bytes));
+        const uint64_t slot_alloc_start_ns = now_ns();
         for (uint32_t idx = 0; idx < slot_count; ++idx) {
           auto slot = std::make_unique<Slot>();
           alloc_slot(ctx, *slot, dst_capacity);
           slots.push_back(std::move(slot));
         }
+        worker_profiles[worker].slot_alloc_ns += now_ns() - slot_alloc_start_ns;
 
+        {
+          std::unique_lock<std::mutex> lock(barrier_mutex);
+          ready_workers++;
+          barrier_cv.notify_one();
+          barrier_cv.wait(lock, [&]() { return start_workers; });
+        }
+
+        const uint64_t worker_start_ns = now_ns();
         std::vector<CpaDcDpOpData*> batch;
         batch.reserve(static_cast<size_t>(batch_size));
         uint64_t submitted = 0;
         uint64_t completed = 0;
-        uint64_t next = 0;
-        while (true) {
-          while (submitted - completed >= slot_count) {
-            Slot& slot = *slots[completed % slot_count];
-            poll_until_done(ctx, slot);
-            const PreparedChunk& chunk = payload->chunks[slot.chunk_index];
-            copy_slot_output_to_tensor(slot, output_ptr, chunk.output_offset, chunk.output_len);
-            completed++;
+        for (int64_t loop = 0; loop < loops; ++loop) {
+          uint64_t next = 0;
+          while (true) {
+            while (submitted - completed >= slot_count) {
+              Slot& slot = *slots[completed % slot_count];
+              const uint64_t poll_start_ns = now_ns();
+              poll_until_done(ctx, slot);
+              worker_profiles[worker].poll_wait_ns += now_ns() - poll_start_ns;
+              completed++;
+            }
+            batch.clear();
+            while (batch.size() < static_cast<size_t>(batch_size) &&
+                   submitted - completed + batch.size() < slot_count &&
+                   next < worker_chunks.size()) {
+              Slot& slot = *slots[(submitted + batch.size()) % slot_count];
+              slot.chunk_index = worker_chunks[next];
+              prepare_slot_from_prepared_chunk(
+                  ctx,
+                  slot,
+                  payload->chunks[slot.chunk_index],
+                  session,
+                  CPA_DC_DIR_DECOMPRESS);
+              batch.push_back(slot.op);
+              next++;
+            }
+            if (batch.empty()) {
+              break;
+            }
+            const uint64_t enqueue_start_ns = now_ns();
+            submit_batch(ctx, batch);
+            worker_profiles[worker].enqueue_ns += now_ns() - enqueue_start_ns;
+            submitted += batch.size();
           }
-          batch.clear();
-          while (batch.size() < static_cast<size_t>(batch_size) &&
-                 submitted - completed + batch.size() < slot_count &&
-                 next < worker_chunks.size()) {
-            Slot& slot = *slots[(submitted + batch.size()) % slot_count];
-            slot.chunk_index = worker_chunks[next];
-            prepare_slot_from_prepared_chunk(
-                ctx,
-                slot,
-                payload->chunks[slot.chunk_index],
-                session,
-                CPA_DC_DIR_DECOMPRESS);
-            batch.push_back(slot.op);
-            next++;
-          }
-          if (batch.empty()) {
-            break;
-          }
-          submit_batch(ctx, batch);
-          submitted += batch.size();
         }
         while (completed < submitted) {
           Slot& slot = *slots[completed % slot_count];
+          const uint64_t poll_start_ns = now_ns();
           poll_until_done(ctx, slot);
-          const PreparedChunk& chunk = payload->chunks[slot.chunk_index];
-          copy_slot_output_to_tensor(slot, output_ptr, chunk.output_offset, chunk.output_len);
+          worker_profiles[worker].poll_wait_ns += now_ns() - poll_start_ns;
           completed++;
         }
+        worker_profiles[worker].wall_ns = now_ns() - worker_start_ns;
       } catch (...) {
         errors[worker] = std::current_exception();
+        {
+          std::lock_guard<std::mutex> lock(barrier_mutex);
+          ready_workers++;
+          barrier_cv.notify_one();
+        }
       }
     });
   }
+
+  {
+    std::unique_lock<std::mutex> lock(barrier_mutex);
+    barrier_cv.wait(lock, [&]() { return ready_workers >= workers; });
+    start_workers = true;
+  }
+  const uint64_t total_start_ns = now_ns();
+  barrier_cv.notify_all();
   for (auto& thread : threads) {
     thread.join();
   }
+  const uint64_t total_ns = now_ns() - total_start_ns;
   for (const auto& error : errors) {
     if (error) {
       std::rethrow_exception(error);
     }
   }
-  return output;
+
+  QatDpProfile profile;
+  profile.total_ns = total_ns;
+  profile.chunks = static_cast<int64_t>(payload->chunks.size());
+  profile.workers = static_cast<int64_t>(workers);
+  profile.inflight = inflight;
+  profile.batch = batch_size;
+  profile.compressed_bytes = payload->compressed_bytes * loops;
+  profile.unpacked_bytes = payload->output_bytes * loops;
+  for (const WorkerProfile& worker_profile : worker_profiles) {
+    profile.worker_wall_ns_max =
+        std::max(profile.worker_wall_ns_max, worker_profile.wall_ns);
+    profile.slot_alloc_ns_sum += worker_profile.slot_alloc_ns;
+    profile.enqueue_ns_sum += worker_profile.enqueue_ns;
+    profile.poll_wait_ns_sum += worker_profile.poll_wait_ns;
+    profile.submit_poll_ns_critical = std::max(
+        profile.submit_poll_ns_critical,
+        worker_profile.enqueue_ns + worker_profile.poll_wait_ns);
+  }
+  set_qat_last_profile(profile);
+
+  py::dict out = qat_deflate_last_profile_dp();
+  out["api"] = "qat_dp_window_batch_no_copy";
+  out["loops"] = loops;
+  out["compressed_gbps_worker"] =
+      profile.worker_wall_ns_max > 0
+          ? static_cast<double>(profile.compressed_bytes) * 8.0 /
+                static_cast<double>(profile.worker_wall_ns_max)
+          : 0.0;
+  out["unpacked_gbps_worker"] =
+      profile.worker_wall_ns_max > 0
+          ? static_cast<double>(profile.unpacked_bytes) * 8.0 /
+                static_cast<double>(profile.worker_wall_ns_max)
+          : 0.0;
+  return out;
 }
 
 torch::Tensor qat_deflate_decompress_dequant4_prepared_dp(
@@ -2040,6 +3242,68 @@ std::vector<int64_t> qat_deflate_dp_instance_nodes(int64_t max_instances) {
   return qat_state().nodes(static_cast<size_t>(std::max<int64_t>(0, max_instances)));
 }
 
+py::dict qat_deflate_last_profile_dp() {
+  QatDpProfile profile;
+  {
+    std::lock_guard<std::mutex> lock(qat_profile_mutex());
+    profile = qat_last_profile();
+  }
+  return qat_dp_profile_to_dict(profile);
+}
+
+py::dict qat_deflate_last_prepare_profile_dp() {
+  QatPrepareProfile profile;
+  {
+    std::lock_guard<std::mutex> lock(qat_profile_mutex());
+    profile = qat_last_prepare_profile();
+  }
+  const uint64_t accounted_ns =
+      profile.parse_ns + profile.qat_state_ns + profile.qae_alloc_ns_sum +
+      profile.qae_input_copy_ns_sum + profile.file_read_io_ns +
+      profile.file_read_sleep_ns;
+  const uint64_t file_read_ns = profile.file_read_io_ns + profile.file_read_sleep_ns;
+  const uint64_t other_ns =
+      profile.total_ns > accounted_ns ? profile.total_ns - accounted_ns : 0;
+  py::dict out;
+  out["prepare_total_ms"] = ns_to_ms(profile.total_ns);
+  out["prepare_parse_ms"] = ns_to_ms(profile.parse_ns);
+  out["prepare_qat_state_ms"] = ns_to_ms(profile.qat_state_ns);
+  out["prepare_qae_alloc_ms_sum"] = ns_to_ms(profile.qae_alloc_ns_sum);
+  out["prepare_qae_input_copy_ms_sum"] =
+      ns_to_ms(profile.qae_input_copy_ns_sum);
+  out["prepare_file_read_ms"] = ns_to_ms(file_read_ns);
+  out["prepare_file_read_io_ms"] = ns_to_ms(profile.file_read_io_ns);
+  out["prepare_file_read_sleep_ms"] = ns_to_ms(profile.file_read_sleep_ns);
+  out["prepare_other_ms"] = ns_to_ms(other_ns);
+  out["prepare_chunks"] = profile.chunks;
+  out["prepare_workers"] = profile.workers;
+  out["prepare_compressed_bytes"] = profile.compressed_bytes;
+  out["prepare_unpacked_bytes"] = profile.unpacked_bytes;
+  out["prepare_bundle_bytes"] = profile.bundle_bytes;
+  out["prepare_file_read_bytes"] = profile.file_read_bytes;
+  out["prepare_qae_buffer_reuse_hits"] = profile.qae_buffer_reuse_hits;
+  out["prepare_qae_buffer_reuse_misses"] = profile.qae_buffer_reuse_misses;
+  out["prepare_dynamic_huffman"] = profile.dynamic_huffman;
+  out["prepare_qae_input_copy_gbps"] =
+      profile.qae_input_copy_ns_sum > 0
+          ? static_cast<double>(profile.compressed_bytes) * 8.0 /
+                static_cast<double>(profile.qae_input_copy_ns_sum)
+          : 0.0;
+  out["prepare_file_read_gbps"] =
+      file_read_ns > 0
+          ? static_cast<double>(profile.file_read_bytes) * 8.0 /
+                static_cast<double>(file_read_ns)
+          : 0.0;
+  out["prepare_file_read_io_gbps"] =
+      profile.file_read_io_ns > 0
+          ? static_cast<double>(profile.file_read_bytes) * 8.0 /
+                static_cast<double>(profile.file_read_io_ns)
+          : 0.0;
+  out["prepare_qae_allocs_per_chunk"] =
+      profile.chunks > 0 ? 1.0 : 0.0;
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<QatPreparedPayload, std::shared_ptr<QatPreparedPayload>>(
       m, "QatPreparedPayload")
@@ -2113,6 +3377,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("file_offset") = 0,
       py::call_guard<py::gil_scoped_release>());
   m.def(
+      "qat_deflate_prepare_bundle_dp",
+      &qat_deflate_prepare_bundle_dp,
+      py::arg("bundle"),
+      py::arg("dynamic_huffman") = true,
+      py::arg("max_instances") = 16,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "qat_deflate_prepare_bundle_from_file_dp",
+      &qat_deflate_prepare_bundle_from_file_dp,
+      py::arg("path"),
+      py::arg("dynamic_huffman") = true,
+      py::arg("max_instances") = 16,
+      py::arg("bandwidth_gbps") = 0.0,
+      py::arg("file_offset") = 0,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
       "qat_deflate_decompress_prepared_dp",
       &qat_deflate_decompress_prepared_dp,
       py::arg("payload"),
@@ -2120,6 +3400,51 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("batch") = 16,
       py::arg("max_instances") = 16,
       py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "qat_deflate_decompress_prepared_into_dp",
+      &qat_deflate_decompress_prepared_into_dp,
+      py::arg("payload"),
+      py::arg("output"),
+      py::arg("inflight") = 2,
+      py::arg("batch") = 16,
+      py::arg("max_instances") = 16,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "qat_deflate_decompress_prepared_window_dp",
+      &qat_deflate_decompress_prepared_window_dp,
+      py::arg("payload"),
+      py::arg("indices"),
+      py::arg("inflight") = 2,
+      py::arg("batch") = 16,
+      py::arg("max_instances") = 16,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "qat_deflate_decompress_prepared_window_into_dp",
+      &qat_deflate_decompress_prepared_window_into_dp,
+      py::arg("payload"),
+      py::arg("indices"),
+      py::arg("output"),
+      py::arg("inflight") = 2,
+      py::arg("batch") = 16,
+      py::arg("max_instances") = 16,
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "qat_deflate_decompress_prepared_window_with_profile_into_dp",
+      &qat_deflate_decompress_prepared_window_with_profile_into_dp,
+      py::arg("payload"),
+      py::arg("indices"),
+      py::arg("output"),
+      py::arg("inflight") = 2,
+      py::arg("batch") = 16,
+      py::arg("max_instances") = 16);
+  m.def(
+      "qat_deflate_profile_prepared_window_dp",
+      &qat_deflate_profile_prepared_window_dp,
+      py::arg("payload"),
+      py::arg("inflight") = 32,
+      py::arg("batch") = 32,
+      py::arg("max_instances") = 16,
+      py::arg("loops") = 1);
   m.def(
       "qat_deflate_decompress_dequant4_prepared_dp",
       &qat_deflate_decompress_dequant4_prepared_dp,
@@ -2154,4 +3479,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "qat_deflate_dp_instance_nodes",
       &qat_deflate_dp_instance_nodes,
       py::arg("max_instances") = 0);
+  m.def(
+      "qat_deflate_last_profile_dp",
+      &qat_deflate_last_profile_dp);
+  m.def(
+      "qat_deflate_last_prepare_profile_dp",
+      &qat_deflate_last_prepare_profile_dp);
 }

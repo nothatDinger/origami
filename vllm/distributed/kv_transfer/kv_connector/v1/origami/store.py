@@ -221,7 +221,7 @@ class LocalFileOrigamiStore(OrigamiStore):
                 paths.append(self._payload_path(cache_key))
             elif (
                 lossless_backend == "qat"
-                and native_cpu.qat_codec_path() == "dpucomp_dp"
+                and native_cpu.qat_codec() == "qat_codec"
                 and self._qat_bundle_path(cache_key).exists()
             ):
                 paths.append(self._qat_bundle_path(cache_key))
@@ -271,7 +271,7 @@ class LocalFileOrigamiStore(OrigamiStore):
 
         if (
             lossless_backend == "qat"
-            and native_cpu.qat_codec_path() == "dpucomp_dp"
+            and native_cpu.qat_codec() == "qat_codec"
             and self._qat_bundle_path(cache_key).exists()
         ):
             bundle_path = self._qat_bundle_path(cache_key)
@@ -381,8 +381,8 @@ class LocalFileOrigamiStore(OrigamiStore):
                     "request_id": request_id,
                     "cache_key": cache_key,
                     "layer_name": "__request__",
-                    "scope": "dpucomp_dp_bundle",
-                    "qat_codec_path": native_cpu.qat_codec_path(),
+                    "scope": "qat_codec_bundle",
+                    "qat_codec": native_cpu.qat_codec(),
                     "chunks": len(refs),
                     "compressed_bytes": compressed_bytes,
                     "unpacked_bytes": unpacked_bytes,
@@ -417,7 +417,7 @@ class LocalFileOrigamiStore(OrigamiStore):
                         prepared=prepared,
                     )
                 ],
-                artifact_format="bundle_v1_dpucomp_dp",
+                artifact_format="bundle_v1_qat_codec",
             )
 
         if lossless_backend == "qat" and not native_cpu.qat_uses_prepared_restore():
@@ -680,14 +680,14 @@ class LocalFileOrigamiStore(OrigamiStore):
         return refs
 
     @staticmethod
-    def _write_dpucomp_header(
+    def _write_qat_bundle_header(
         handle: Any,
         *,
         chunk_bytes: int,
         records: list[tuple[int, int]],
     ) -> None:
         raw_bytes = sum(raw_len for raw_len, _ in records)
-        handle.write(b"DPUCDZ1\0")
+        handle.write(b"ORIGQZ1\0")
         handle.write(struct.pack("<IIQ", int(chunk_bytes), len(records), raw_bytes))
         for raw_len, comp_len in records:
             handle.write(struct.pack("<II", int(raw_len), int(comp_len)))
@@ -739,7 +739,7 @@ class LocalFileOrigamiStore(OrigamiStore):
         with payload_path.open("wb") as handle:
             if create_qat_bundle:
                 with qat_bundle_path.open("wb") as qat_handle:
-                    self._write_dpucomp_header(
+                    self._write_qat_bundle_header(
                         qat_handle,
                         chunk_bytes=max_chunk_bytes,
                         records=qat_records,
@@ -840,7 +840,7 @@ class LocalFileOrigamiStore(OrigamiStore):
             "request_groups": request_groups,
             "qat_bundle": (
                 {
-                    "format": "DPUCDZ1",
+                    "format": "ORIGQZ1",
                     "path": "qat_bundle.dz",
                     "chunk_bytes": max_chunk_bytes,
                     "chunks": len(qat_records),

@@ -2,12 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import torch
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+if os.environ.get("ORIGAMI_LIGHT_IMPORT") != "1":
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+else:
+
+    class KVConnectorMetadata:  # noqa: D101
+        pass
 
 LosslessPath = Literal["cpu", "gpu"]
 

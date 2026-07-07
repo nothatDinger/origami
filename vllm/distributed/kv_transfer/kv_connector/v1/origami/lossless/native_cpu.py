@@ -23,7 +23,7 @@ _BUILD_ROOT = Path(
     )
 )
 _VERBOSE = bool(int(os.environ.get("ORIGAMI_NATIVE_VERBOSE", "0")))
-_DEFAULT_QAT_CODEC_PATH = "dpucomp_dp"
+_DEFAULT_QAT_CODEC = "qat_codec"
 _LAST_QAT_PROFILE: dict[str, Any] = {}
 _LAST_QAT_PREPARE_PROFILE: dict[str, Any] = {}
 _QAT_PROFILE_FALLBACK_LOCK = Lock()
@@ -96,23 +96,22 @@ def load_qat_cpa_extension() -> Any:
     )
 
 
-def qat_codec_path() -> str:
-    value = os.environ.get("ORIGAMI_QAT_CODEC_PATH", _DEFAULT_QAT_CODEC_PATH)
+def qat_codec() -> str:
+    value = os.environ.get("ORIGAMI_QAT_CODEC", _DEFAULT_QAT_CODEC)
     value = value.strip().lower()
-    if value in {"cpa", "dpucomp", "cachegen"}:
+    if value == "cpa":
         return "cpa"
-    if value in {"dpucomp_dp", "dp_window", "dp_bundle", "cpa_dp"}:
-        return "dpucomp_dp"
+    if value in {"qat_codec", "qat"}:
+        return "qat_codec"
     if value in {"dp", "dp_prepared", "prepared"}:
         return "dp_prepared"
     raise ValueError(
-        "ORIGAMI_QAT_CODEC_PATH must be one of "
-        "{'cpa', 'dpucomp_dp', 'dp_prepared'}"
+        "ORIGAMI_QAT_CODEC must be one of {'qat_codec', 'cpa', 'dp_prepared'}"
     )
 
 
 def qat_uses_prepared_restore() -> bool:
-    return qat_codec_path() in {"dpucomp_dp", "dp_prepared"}
+    return qat_codec() in {"qat_codec", "dp_prepared"}
 
 
 def normalize_symbol_layout(layout: Sequence[str]) -> list[str]:
@@ -284,7 +283,7 @@ def cpu_isa() -> str:
 
 
 def qat_instance_count(max_instances: int = 0) -> int:
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         ext = load_qat_cpa_extension()
         count = int(ext.qat_deflate_instance_count())
         if max_instances and max_instances > 0:
@@ -298,7 +297,7 @@ def qat_instance_count(max_instances: int = 0) -> int:
 
 
 def qat_instance_nodes(max_instances: int = 0) -> list[int]:
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         count = qat_instance_count(max_instances)
         return [-1 for _ in range(count)]
     ext = load_qat_extension()
@@ -416,7 +415,7 @@ def compress_raw_deflate_many(
     batch: int = 32,
     max_instances: int = 16,
 ) -> list[torch.Tensor]:
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         return _compress_raw_deflate_many_cpa(chunks, dynamic_huffman=dynamic_huffman)
     return _compress_raw_deflate_many_dp(
         chunks,
@@ -515,7 +514,7 @@ def decompress_raw_deflate_many(
     batch: int = 32,
     max_instances: int = 16,
 ) -> list[torch.Tensor]:
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         return _decompress_raw_deflate_many_cpa(
             chunks,
             output_bytes,
@@ -637,7 +636,7 @@ def prepare_raw_deflate_many(
     dynamic_huffman: bool = True,
     max_instances: int = 16,
 ) -> QatPreparedPayload:
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         payloads: list[CpaPreparedPayloadItem] = []
         for chunk, out_bytes in zip(chunks, output_bytes):
             out_bytes = int(out_bytes)
@@ -693,7 +692,7 @@ def prepare_raw_deflate_bytestream(
     if lengths_tensor.dim() != 1:
         lengths_tensor = lengths_tensor.reshape(-1).contiguous()
     lengths_to_tensor_ms = (time.perf_counter() - lengths_start) * 1000.0
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         _set_last_qat_prepare_profile(
             {
                 "prepare_python_wrapper_ms": (time.perf_counter() - wrapper_start)
@@ -761,7 +760,7 @@ def prepare_raw_deflate_file(
         )
     if lengths_tensor.dim() != 1:
         lengths_tensor = lengths_tensor.reshape(-1).contiguous()
-    if qat_codec_path() == "cpa":
+    if qat_codec() == "cpa":
         total = int(lengths_tensor.sum().item())
         with open(path, "rb") as handle:
             if file_offset:
@@ -795,10 +794,10 @@ def prepare_raw_deflate_bundle(
     dynamic_huffman: bool = True,
     max_instances: int = 16,
 ) -> QatPreparedPayload:
-    if qat_codec_path() != "dpucomp_dp":
+    if qat_codec() != "qat_codec":
         raise RuntimeError(
             "Origami request-level bundle restore requires "
-            "ORIGAMI_QAT_CODEC_PATH=dpucomp_dp"
+            "ORIGAMI_QAT_CODEC=qat_codec"
         )
     wrapper_start = time.perf_counter()
     tensor_start = time.perf_counter()
@@ -838,10 +837,10 @@ def prepare_raw_deflate_bundle_file(
     bandwidth_gbps: float = 0.0,
     file_offset: int = 0,
 ) -> QatPreparedPayload:
-    if qat_codec_path() != "dpucomp_dp":
+    if qat_codec() != "qat_codec":
         raise RuntimeError(
             "Origami request-level bundle restore requires "
-            "ORIGAMI_QAT_CODEC_PATH=dpucomp_dp"
+            "ORIGAMI_QAT_CODEC=qat_codec"
         )
     wrapper_start = time.perf_counter()
     load_start = time.perf_counter()
@@ -1037,8 +1036,8 @@ def profile_prepared_raw_deflate_window(
 ) -> dict[str, Any]:
     """Run a CPA-style no-copy prepared decompress profile.
 
-    This intentionally does not return restored bytes. It mirrors the dpucomp
-    window benchmark by measuring enqueue/poll throughput on already prepared
+    This intentionally does not return restored bytes. It mirrors the window
+    benchmark by measuring enqueue/poll throughput on already prepared
     QAT DMA input and reusable worker-local destination slots.
     """
     if any(isinstance(item, CpaPreparedPayloadItem) for item in payload.payloads):

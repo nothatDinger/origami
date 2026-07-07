@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Derived from /home/td/dpucomp/kvtc/qat_dp_codec.cpp for Origami native CPU lossless.
+// Origami native CPU lossless codec using the QAT data-plane API.
 
 #include <torch/extension.h>
 
@@ -48,7 +48,8 @@ constexpr uint32_t kAlignment = 64;
 constexpr uint32_t kMaxQaeAllocBytes = 64U * 1024U * 1024U;
 constexpr uint32_t kMinDcDestBytes = 2048U;
 constexpr uint32_t kProjectWorkerCap = 4U;
-constexpr char kDpuCompDzMagic[8] = {'D', 'P', 'U', 'C', 'D', 'Z', '1', '\0'};
+constexpr char kOrigamiQatBundleMagic[8] = {
+    'O', 'R', 'I', 'G', 'Q', 'Z', '1', '\0'};
 
 uint64_t now_ns() {
   return static_cast<uint64_t>(
@@ -1812,21 +1813,22 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_dp(
   TORCH_CHECK(bundle.dim() == 1, "bundle must be one-dimensional");
   const int64_t bundle_bytes = bundle.numel();
   profile.bundle_bytes = bundle_bytes;
-  TORCH_CHECK(bundle_bytes >= 24, "DPUCDZ1 bundle is too small");
+  TORCH_CHECK(bundle_bytes >= 24, "ORIGQZ1 bundle is too small");
   const auto* data = bundle.data_ptr<uint8_t>();
   TORCH_CHECK(
-      std::memcmp(data, kDpuCompDzMagic, sizeof(kDpuCompDzMagic)) == 0,
-      "invalid DPUCDZ1 bundle magic");
+      std::memcmp(data, kOrigamiQatBundleMagic,
+                  sizeof(kOrigamiQatBundleMagic)) == 0,
+      "invalid ORIGQZ1 bundle magic");
 
   const uint32_t chunk_bytes = load_u32_le(data + 8);
   const uint32_t chunk_count = load_u32_le(data + 12);
   const uint64_t raw_bytes = load_u64_le(data + 16);
-  TORCH_CHECK(chunk_bytes > 0, "DPUCDZ1 chunk_bytes must be positive");
-  TORCH_CHECK(chunk_count > 0, "DPUCDZ1 chunk_count must be positive");
+  TORCH_CHECK(chunk_bytes > 0, "ORIGQZ1 chunk_bytes must be positive");
+  TORCH_CHECK(chunk_count > 0, "ORIGQZ1 chunk_count must be positive");
   const uint64_t records_bytes = static_cast<uint64_t>(chunk_count) * 8ULL;
   const uint64_t header_bytes = 24ULL + records_bytes;
   TORCH_CHECK(header_bytes <= static_cast<uint64_t>(bundle_bytes),
-              "DPUCDZ1 record table exceeds bundle size");
+              "ORIGQZ1 record table exceeds bundle size");
 
   struct DzRecord {
     uint32_t raw_len = 0;
@@ -1848,17 +1850,17 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_dp(
     record.output_offset = raw_sum;
     cursor += 8;
     TORCH_CHECK(record.raw_len > 0 && record.raw_len <= chunk_bytes,
-                "invalid DPUCDZ1 raw chunk length");
-    TORCH_CHECK(record.comp_len > 0, "invalid DPUCDZ1 compressed chunk length");
+                "invalid ORIGQZ1 raw chunk length");
+    TORCH_CHECK(record.comp_len > 0, "invalid ORIGQZ1 compressed chunk length");
     TORCH_CHECK(record.comp_len < kMaxQaeAllocBytes,
-                "DPUCDZ1 prepared restore only supports compressed chunks below 64 MiB");
+                "ORIGQZ1 prepared restore only supports compressed chunks below 64 MiB");
     raw_sum += record.raw_len;
     comp_sum += record.comp_len;
     records.push_back(record);
   }
-  TORCH_CHECK(raw_sum == raw_bytes, "DPUCDZ1 raw size mismatch");
+  TORCH_CHECK(raw_sum == raw_bytes, "ORIGQZ1 raw size mismatch");
   TORCH_CHECK(header_bytes + comp_sum == static_cast<uint64_t>(bundle_bytes),
-              "DPUCDZ1 compressed payload size mismatch");
+              "ORIGQZ1 compressed payload size mismatch");
   profile.parse_ns = now_ns() - parse_start_ns;
   profile.chunks = chunk_count;
   profile.compressed_bytes = static_cast<int64_t>(comp_sum);
@@ -1932,17 +1934,18 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_from_file_dp(
 
     uint64_t parse_start_ns = now_ns();
     TORCH_CHECK(
-        std::memcmp(header, kDpuCompDzMagic, sizeof(kDpuCompDzMagic)) == 0,
-        "invalid DPUCDZ1 bundle magic");
+        std::memcmp(header, kOrigamiQatBundleMagic,
+                    sizeof(kOrigamiQatBundleMagic)) == 0,
+        "invalid ORIGQZ1 bundle magic");
     const uint32_t chunk_bytes = load_u32_le(header + 8);
     const uint32_t chunk_count = load_u32_le(header + 12);
     const uint64_t raw_bytes = load_u64_le(header + 16);
-    TORCH_CHECK(chunk_bytes > 0, "DPUCDZ1 chunk_bytes must be positive");
-    TORCH_CHECK(chunk_count > 0, "DPUCDZ1 chunk_count must be positive");
+    TORCH_CHECK(chunk_bytes > 0, "ORIGQZ1 chunk_bytes must be positive");
+    TORCH_CHECK(chunk_count > 0, "ORIGQZ1 chunk_count must be positive");
     const uint64_t records_bytes = static_cast<uint64_t>(chunk_count) * 8ULL;
     const uint64_t header_bytes = 24ULL + records_bytes;
     TORCH_CHECK(records_bytes <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max()),
-                "DPUCDZ1 record table too large");
+                "ORIGQZ1 record table too large");
     profile.parse_ns += now_ns() - parse_start_ns;
 
     std::vector<uint8_t> record_bytes(static_cast<size_t>(records_bytes));
@@ -1976,15 +1979,15 @@ std::shared_ptr<QatPreparedPayload> qat_deflate_prepare_bundle_from_file_dp(
       record.output_offset = raw_sum;
       cursor += 8;
       TORCH_CHECK(record.raw_len > 0 && record.raw_len <= chunk_bytes,
-                  "invalid DPUCDZ1 raw chunk length");
-      TORCH_CHECK(record.comp_len > 0, "invalid DPUCDZ1 compressed chunk length");
+                  "invalid ORIGQZ1 raw chunk length");
+      TORCH_CHECK(record.comp_len > 0, "invalid ORIGQZ1 compressed chunk length");
       TORCH_CHECK(record.comp_len < kMaxQaeAllocBytes,
-                  "DPUCDZ1 prepared restore only supports compressed chunks below 64 MiB");
+                  "ORIGQZ1 prepared restore only supports compressed chunks below 64 MiB");
       raw_sum += record.raw_len;
       comp_sum += record.comp_len;
       records.push_back(record);
     }
-    TORCH_CHECK(raw_sum == raw_bytes, "DPUCDZ1 raw size mismatch");
+    TORCH_CHECK(raw_sum == raw_bytes, "ORIGQZ1 raw size mismatch");
     profile.parse_ns += now_ns() - parse_start_ns;
     profile.chunks = chunk_count;
     profile.compressed_bytes = static_cast<int64_t>(comp_sum);

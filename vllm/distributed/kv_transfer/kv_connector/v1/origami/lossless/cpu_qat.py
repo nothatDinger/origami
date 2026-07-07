@@ -36,11 +36,11 @@ class CpuLosslessCodec:
         self.qat_inflight = int(qat_inflight)
         self.qat_batch = int(qat_batch)
         self.qat_max_instances = int(qat_max_instances)
-        self.qat_codec_path = native_cpu.qat_codec_path()
+        self.qat_codec = native_cpu.qat_codec()
         self._qat_error: str | None = None
         if backend == "qat":
             try:
-                if self.qat_codec_path == "cpa":
+                if self.qat_codec == "cpa":
                     native_cpu.load_qat_cpa_extension()
                 else:
                     native_cpu.load_qat_extension()

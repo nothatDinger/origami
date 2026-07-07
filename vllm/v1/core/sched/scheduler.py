@@ -1541,12 +1541,71 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _request_has_origami_restore_priority(self, request: Request) -> bool:
+        if (
+            self.connector is None
+            or type(self.connector).__name__ != "OrigamiConnector"
+        ):
+            return False
+        config = getattr(self.connector, "config", None)
+        if getattr(config, "batch_policy", "restored_priority_mixed") != (
+            "restored_priority_mixed"
+        ):
+            return False
+        params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(params, dict):
+            return False
+        return bool(
+            params.get("origami_resume_prefill")
+            or params.get("origami_cache_key")
+            or params.get("origami_payload_id")
+        )
+
+    def _promote_origami_restored_prefill(
+        self, request_queue: RequestQueue
+    ) -> None:
+        if not request_queue:
+            return
+        if self._request_has_origami_restore_priority(request_queue.peek_request()):
+            return
+        for request in request_queue:
+            if self._request_has_origami_restore_priority(request):
+                request_queue.remove_request(request)
+                request_queue.prepend_request(request)
+                return
+
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        if self.waiting:
+            self._promote_origami_restored_prefill(self.waiting)
+        if self.skipped_waiting:
+            self._promote_origami_restored_prefill(self.skipped_waiting)
+
         if self.policy == SchedulingPolicy.FCFS:
+            if self.waiting and self.skipped_waiting:
+                waiting_is_restored = self._request_has_origami_restore_priority(
+                    self.waiting.peek_request()
+                )
+                skipped_is_restored = self._request_has_origami_restore_priority(
+                    self.skipped_waiting.peek_request()
+                )
+                if waiting_is_restored != skipped_is_restored:
+                    return (
+                        self.waiting if waiting_is_restored else self.skipped_waiting
+                    )
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
+            waiting_is_restored = self._request_has_origami_restore_priority(
+                self.waiting.peek_request()
+            )
+            skipped_is_restored = self._request_has_origami_restore_priority(
+                self.skipped_waiting.peek_request()
+            )
+            if waiting_is_restored != skipped_is_restored:
+                return (
+                    self.waiting if waiting_is_restored else self.skipped_waiting
+                )
             waiting_req = self.waiting.peek_request()
             skipped_req = self.skipped_waiting.peek_request()
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting

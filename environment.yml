@@ -1,0 +1,19 @@
+name: origami
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - cmake>=3.26.1
+  - ninja
+  - numpy
+  - packaging>=24.2
+  - psutil
+  - pyyaml
+  - pytorch=2.10.0
+  - pip:
+      - pyzmq>=25.0.0
+      - msgspec
+      - pydantic>=2.12.0

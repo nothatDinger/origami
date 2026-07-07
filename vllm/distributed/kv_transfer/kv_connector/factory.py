@@ -202,6 +202,31 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
     "DecodeBenchConnector",
 )
+
+KVConnectorFactory.register_connector(
+    "OrigamiConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.origami.connector",
+    "OrigamiConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "RawKVReuseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.origami.benchmark_connectors",
+    "RawKVReuseConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "CacheGenReuseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.origami.benchmark_connectors",
+    "CacheGenReuseConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "OrigamiReuseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.origami.benchmark_connectors",
+    "OrigamiReuseConnector",
+)
+
 KVConnectorFactory.register_connector(
     "MooncakeConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector",

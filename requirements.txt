@@ -1,0 +1,11 @@
+# Basic packages for Origami environment checks, tests, and patch utilities.
+pytest>=8
+numpy
+packaging>=24.2
+cmake>=3.26.1
+ninja
+psutil
+pyzmq>=25.0.0
+msgspec
+pydantic>=2.12.0
+pyyaml

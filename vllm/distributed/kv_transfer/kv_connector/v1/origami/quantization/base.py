@@ -55,4 +55,3 @@ class QuantizerAdapter(ABC):
 
     def metadata_schema(self) -> dict[str, Any]:
         return {"quantizer": self.quantizer_id, "version": 1}
-

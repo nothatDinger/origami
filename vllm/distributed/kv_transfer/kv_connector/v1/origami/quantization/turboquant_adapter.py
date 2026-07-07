@@ -9,4 +9,3 @@ from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.raw_tenso
 
 class TurboQuantAdapter(TorchSerializedTensorAdapter):
     quantizer_id = "turboquant"
-

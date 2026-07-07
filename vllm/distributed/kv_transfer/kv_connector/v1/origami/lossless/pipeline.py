@@ -16,4 +16,3 @@ def select_gpu_lossless_requests(
     count = int(round(len(request_ids) * ratio / 100.0))
     count = max(1, min(len(request_ids), count))
     return set(sorted(request_ids)[:count])
-

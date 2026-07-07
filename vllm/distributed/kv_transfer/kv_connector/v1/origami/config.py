@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from vllm.config import VllmConfig
+if TYPE_CHECKING or os.environ.get("ORIGAMI_LIGHT_IMPORT") != "1":
+    from vllm.config import VllmConfig
+else:
+    VllmConfig = Any  # type: ignore[misc, assignment]
 
 GpuLosslessRatio = Literal["auto", "cpu", "gpu", 0, 25, 50, 75, 100]
 NormalizedGpuLosslessRatio = Literal["auto", 0, 25, 50, 75, 100]

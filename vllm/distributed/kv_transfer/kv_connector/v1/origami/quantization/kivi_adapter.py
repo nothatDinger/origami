@@ -36,6 +36,11 @@ def _pack_lowbit_values(values: torch.Tensor, bits: int) -> torch.Tensor:
             vals = torch.cat([vals, torch.zeros(1, dtype=torch.uint8)])
         pairs = vals.reshape(-1, 2)
         return (pairs[:, 0] | (pairs[:, 1] << 4)).contiguous()
+    if bits == 3:
+        if vals.numel() % 2:
+            vals = torch.cat([vals, torch.zeros(1, dtype=torch.uint8)])
+        pairs = vals.reshape(-1, 2)
+        return ((pairs[:, 0] & 0x07) | ((pairs[:, 1] & 0x07) << 4)).contiguous()
     if bits == 2:
         pad = (-int(vals.numel())) % 4
         if pad:
@@ -47,7 +52,7 @@ def _pack_lowbit_values(values: torch.Tensor, bits: int) -> torch.Tensor:
             | ((groups[:, 2] & 0x03) << 4)
             | ((groups[:, 3] & 0x03) << 6)
         ).contiguous()
-    raise ValueError("KIVI adapter supports only 2, 4, or 8 bit packing")
+    raise ValueError("KIVI adapter supports only 2, 3, 4, or 8 bit packing")
 
 
 def _unpack_lowbit_values(
@@ -68,6 +73,12 @@ def _unpack_lowbit_values(
         out[0::2] = src.cpu() & 0x0F
         out[1::2] = (src.cpu() >> 4) & 0x0F
         return out[:count].contiguous().to(device=device)
+    if bits == 3:
+        out = torch.empty((int(src.numel()) * 2,), dtype=torch.uint8)
+        src_cpu = src.cpu()
+        out[0::2] = src_cpu & 0x07
+        out[1::2] = (src_cpu >> 4) & 0x07
+        return out[:count].contiguous().to(device=device)
     if bits == 2:
         out = torch.empty((int(src.numel()) * 4,), dtype=torch.uint8)
         src_cpu = src.cpu()
@@ -76,7 +87,7 @@ def _unpack_lowbit_values(
         out[2::4] = (src_cpu >> 4) & 0x03
         out[3::4] = (src_cpu >> 6) & 0x03
         return out[:count].contiguous().to(device=device)
-    raise ValueError("KIVI adapter supports only 2, 4, or 8 bit packing")
+    raise ValueError("KIVI adapter supports only 2, 3, 4, or 8 bit packing")
 
 
 def _pack_ordered_lowbit(
@@ -133,8 +144,8 @@ class KiviAdapter(QuantizerAdapter):
         )
         self.dequant_device = str(self.config.get("dequant_device", "auto")).lower()
         self.last_profile: list[dict[str, Any]] = []
-        if self.bits not in {2, 4, 8}:
-            raise ValueError("KiviAdapter bits must be one of {2, 4, 8}")
+        if self.bits not in {2, 3, 4, 8}:
+            raise ValueError("KiviAdapter bits must be one of {2, 3, 4, 8}")
         if self.group_size <= 0:
             raise ValueError("KiviAdapter group_size must be positive")
         if self.sink_tokens < 0:

@@ -19,6 +19,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.origami.benchmark_utils import
     write_jsonl,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import OrigamiConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.origami.fused_attention import (
+    FusedLayerPayload,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import native_cpu
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import native_gpu
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.chunking import (
@@ -85,6 +88,7 @@ class _LayerLoadResult:
     event: torch.cuda.Event | None = None
     pending_metrics: list[tuple[str, OrigamiRestoreRequest, LayerPayload,
                                 dict[str, Any]]] | None = None
+    wait_on_current_stream: bool = True
 
 
 def _ms_since(start: float) -> float:
@@ -194,10 +198,13 @@ class OrigamiConnectorWorker:
         config: OrigamiConfig,
         store: OrigamiStore,
         kv_cache_config: Any | None = None,
+        *,
+        fused_attention_enabled: bool = False,
     ):
         self.config = config
         self.store = store
         self.kv_cache_config = kv_cache_config
+        self.fused_attention_enabled = bool(fused_attention_enabled)
         self.quantizer: QuantizerAdapter = create_quantizer_adapter(
             config.quantizer, config.quantizer_config
         )
@@ -222,6 +229,17 @@ class OrigamiConnectorWorker:
         self._save_futures: list[Future[tuple[OrigamiSaveRequest, LayerPayload]]] = []
         self._save_payloads: dict[str, OrigamiPayload] = {}
         self._save_lock = Lock()
+        self._fused_lock = Lock()
+        self._fused_payloads: dict[
+            tuple[str, str, str], FusedLayerPayload
+        ] = {}
+        self._request_fused_keys: dict[
+            str, dict[str, tuple[str, str, str]]
+        ] = {}
+        self._fused_upload_stream: torch.cuda.Stream | None = None
+        self._fused_attention_stream: torch.cuda.Stream | None = None
+        self._fused_qkv_ready_event: torch.cuda.Event | None = None
+        self._fused_done_event: torch.cuda.Event | None = None
         self._metadata: OrigamiConnectorMetadata | None = None
         self.metrics_path = (
             str(Path(config.metrics_dir) / "origami_metrics.jsonl")
@@ -241,6 +259,154 @@ class OrigamiConnectorWorker:
                     or config.dequant_device in {"gpu", "cuda"}
                 ):
                     raise
+        if self.fused_attention_enabled:
+            capability = torch.cuda.get_device_capability()
+            if capability < (8, 0):
+                if config.fused_attention == "required":
+                    raise RuntimeError(
+                        "Origami fused attention requires CUDA compute capability 8.0+"
+                    )
+                self.fused_attention_enabled = False
+            else:
+                try:
+                    native_gpu.load_bitpack_cuda_extension()
+                except Exception:
+                    if config.fused_attention == "required":
+                        raise
+                    self.fused_attention_enabled = False
+            if self.fused_attention_enabled:
+                self._fused_upload_stream = torch.cuda.Stream(priority=0)
+                self._fused_attention_stream = torch.cuda.Stream(
+                    priority=config.fused_stream_priority
+                )
+                self._fused_qkv_ready_event = torch.cuda.Event()
+                self._fused_done_event = torch.cuda.Event()
+
+    def _store_fused_layer_payload(
+        self,
+        restore: OrigamiRestoreRequest,
+        layer_payload: LayerPayload,
+        symbols: torch.Tensor,
+    ) -> _LayerLoadResult | None:
+        metadata = layer_payload.quant_metadata
+        fmt = str(metadata.get("format", ""))
+        expected_format = {
+            "kivi": "kivi_structured_blob",
+            "kvquant": "kvquant_structured_blob",
+        }.get(self.quantizer.quantizer_id)
+        artifact_compatible = (
+            expected_format is not None
+            and fmt == expected_format
+            and int(metadata.get("token_count", 0)) == int(restore.num_tokens)
+        )
+        if not self.fused_attention_enabled or self._fused_upload_stream is None:
+            return None
+        if not artifact_compatible:
+            if self.config.fused_attention == "required":
+                raise RuntimeError(
+                    "Origami fused attention requires a full structured "
+                    f"{self.quantizer.quantizer_id} prefix artifact"
+                )
+            return None
+
+        key = (restore.cache_key, layer_payload.layer_name, self.quantizer.quantizer_id)
+        with self._fused_lock:
+            existing = self._fused_payloads.get(key)
+            if existing is not None:
+                request_keys = self._request_fused_keys.setdefault(
+                    restore.request_id, {}
+                )
+                if request_keys.get(layer_payload.layer_name) != key:
+                    existing.ref_count += 1
+                    request_keys[layer_payload.layer_name] = key
+                return _LayerLoadResult(
+                    event=existing.ready_event,
+                    wait_on_current_stream=False,
+                )
+
+        kv_cache = self.kv_caches[layer_payload.layer_name]
+        producer_event = None
+        if symbols.is_cuda:
+            producer_event = torch.cuda.Event()
+            producer_event.record(torch.cuda.current_stream(symbols.device))
+        with torch.cuda.stream(self._fused_upload_stream):
+            if producer_event is not None:
+                self._fused_upload_stream.wait_event(producer_event)
+            raw = symbols.detach().reshape(-1)
+            raw_gpu = raw.to(
+                device=kv_cache.device,
+                dtype=torch.uint8,
+                non_blocking=True,
+            ).contiguous()
+            ready_event = torch.cuda.Event()
+            ready_event.record(self._fused_upload_stream)
+        payload = FusedLayerPayload(
+            request_id=restore.request_id,
+            cache_key=restore.cache_key,
+            layer_name=layer_payload.layer_name,
+            quantizer=self.quantizer.quantizer_id,
+            symbols=raw_gpu,
+            metadata=dict(metadata),
+            ready_event=ready_event,
+        )
+        with self._fused_lock:
+            raced = self._fused_payloads.get(key)
+            if raced is None:
+                self._fused_payloads[key] = payload
+                selected = payload
+            else:
+                selected = raced
+            request_keys = self._request_fused_keys.setdefault(
+                restore.request_id, {}
+            )
+            if request_keys.get(layer_payload.layer_name) != key:
+                if raced is not None:
+                    raced.ref_count += 1
+                request_keys[layer_payload.layer_name] = key
+        return _LayerLoadResult(
+            event=selected.ready_event,
+            wait_on_current_stream=False,
+        )
+
+    def get_fused_layer_payloads(
+        self,
+        layer_name: str,
+        request_ids: tuple[str, ...] | list[str],
+    ) -> dict[str, FusedLayerPayload]:
+        result: dict[str, FusedLayerPayload] = {}
+        with self._fused_lock:
+            for request_id in request_ids:
+                key = self._request_fused_keys.get(request_id, {}).get(layer_name)
+                if key is not None and key in self._fused_payloads:
+                    result[request_id] = self._fused_payloads[key]
+        return result
+
+    def get_fused_attention_stream_state(self):
+        if not self.fused_attention_enabled:
+            return None
+        if (
+            self._fused_attention_stream is None
+            or self._fused_qkv_ready_event is None
+            or self._fused_done_event is None
+        ):
+            return None
+        return (
+            self._fused_attention_stream,
+            self._fused_qkv_ready_event,
+            self._fused_done_event,
+        )
+
+    def release_fused_requests(self, request_ids: set[str]) -> None:
+        with self._fused_lock:
+            for request_id in request_ids:
+                keys = self._request_fused_keys.pop(request_id, {})
+                for key in keys.values():
+                    payload = self._fused_payloads.get(key)
+                    if payload is None:
+                        continue
+                    payload.ref_count -= 1
+                    if payload.ref_count <= 0:
+                        self._fused_payloads.pop(key, None)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         self.kv_caches = dict(kv_caches)
@@ -286,8 +452,14 @@ class OrigamiConnectorWorker:
             self._pending_request_layer_futures[restore.request_id] = list(
                 layer_futures.values()
             )
+            retained = self._claim_cached_layer_events(restore)
+            restore_fn = (
+                self._restore_retained_request_layer_futures
+                if retained is not None
+                else self._restore_request_layer_futures
+            )
             restore_future = self._executor.submit(
-                self._restore_request_layer_futures,
+                restore_fn,
                 restore,
                 layer_futures,
             )
@@ -308,6 +480,76 @@ class OrigamiConnectorWorker:
             },
         )
 
+    def _retained_layer_events(
+        self, request_id: str
+    ) -> dict[str, torch.cuda.Event] | None:
+        events: dict[str, torch.cuda.Event] = {}
+        with self._fused_lock:
+            request_keys = self._request_fused_keys.get(request_id, {})
+            for layer_name in self.kv_caches:
+                key = request_keys.get(layer_name)
+                payload = self._fused_payloads.get(key) if key is not None else None
+                if payload is None:
+                    return None
+                events[layer_name] = payload.ready_event
+        return events
+
+    def _claim_cached_layer_events(
+        self, restore: OrigamiRestoreRequest
+    ) -> dict[str, torch.cuda.Event] | None:
+        if not self.fused_attention_enabled:
+            return None
+        codec = self.quantizer.quantizer_id
+        with self._fused_lock:
+            cached: dict[
+                str, tuple[tuple[str, str, str], FusedLayerPayload]
+            ] = {}
+            for layer_name in self.kv_caches:
+                key = (restore.cache_key, layer_name, codec)
+                payload = self._fused_payloads.get(key)
+                if payload is None:
+                    return None
+                cached[layer_name] = (key, payload)
+
+            request_keys = self._request_fused_keys.setdefault(
+                restore.request_id, {}
+            )
+            for layer_name, (key, payload) in cached.items():
+                if request_keys.get(layer_name) != key:
+                    payload.ref_count += 1
+                    request_keys[layer_name] = key
+            return {
+                layer_name: payload.ready_event
+                for layer_name, (_, payload) in cached.items()
+            }
+
+    def _restore_retained_request_layer_futures(
+        self,
+        restore: OrigamiRestoreRequest,
+        layer_futures: dict[str, Future[Any]],
+    ) -> str:
+        events = self._retained_layer_events(restore.request_id)
+        if events is None:
+            raise RuntimeError(
+                f"retained Origami payload disappeared for {restore.request_id!r}"
+            )
+        for layer_name, future in layer_futures.items():
+            future.set_result(_LayerLoadResult(
+                event=events[layer_name],
+                wait_on_current_stream=False,
+            ))
+        write_jsonl(
+            self.metrics_path,
+            {
+                "type": "restore_retained_gpu_payload",
+                "system": "origami",
+                "request_id": _restore_metric_id(restore),
+                "cache_key": restore.cache_key,
+                "ts": time.time(),
+            },
+        )
+        return _restore_metric_id(restore)
+
     def wait_for_layer_load(self, layer_name: str) -> None:
         futures = self._pending_layer_futures.pop(layer_name, [])
         for future in futures:
@@ -316,7 +558,15 @@ class OrigamiConnectorWorker:
                 event = result.event
             else:
                 event = result
-            if event is not None and torch.cuda.is_available():
+            wait_on_current_stream = (
+                not isinstance(result, _LayerLoadResult)
+                or result.wait_on_current_stream
+            )
+            if (
+                event is not None
+                and wait_on_current_stream
+                and torch.cuda.is_available()
+            ):
                 torch.cuda.current_stream().wait_event(event)
             if isinstance(result, _LayerLoadResult):
                 self._flush_pending_cuda_metrics(result.pending_metrics)
@@ -333,11 +583,12 @@ class OrigamiConnectorWorker:
             start_event = profile_fields.pop("_cuda_start_event", None)
             end_event = profile_fields.pop("_cuda_end_event", None)
             if start_event is not None and end_event is not None:
-                # Profiling is finalized at the layer wait point so restore
-                # scheduling can continue queuing later QAT windows/layers.
-                end_event.synchronize()
-                elapsed_ms = float(start_event.elapsed_time(end_event))
-                profile_fields["ms"] = elapsed_ms
+                elapsed_ms = None
+                if end_event.query():
+                    elapsed_ms = float(start_event.elapsed_time(end_event))
+                    profile_fields["ms"] = elapsed_ms
+                else:
+                    profile_fields["cuda_timing_deferred"] = True
                 input_bytes = int(profile_fields.get("input_bytes", 0) or 0)
                 output_bytes = int(
                     profile_fields.get(
@@ -345,7 +596,7 @@ class OrigamiConnectorWorker:
                     ) or 0
                 )
                 bytes_value = int(profile_fields.get("bytes", output_bytes) or 0)
-                if elapsed_ms > 0:
+                if elapsed_ms is not None and elapsed_ms > 0:
                     if input_bytes:
                         profile_fields["input_gbps"] = (
                             input_bytes * 8.0 / elapsed_ms / 1e6
@@ -886,6 +1137,14 @@ class OrigamiConnectorWorker:
         if tokens_per_block > 0 and int(restore.num_tokens) > 0:
             needed_blocks = (int(restore.num_tokens) + tokens_per_block - 1) // tokens_per_block
             block_ids = block_ids[:needed_blocks]
+
+        fused_event = self._store_fused_layer_payload(
+            restore,
+            layer_payload,
+            symbols,
+        )
+        if fused_event is not None:
+            return fused_event
 
         direct_event = self._try_restore_direct_to_cache(
             restore,
@@ -1579,10 +1838,8 @@ class OrigamiConnectorWorker:
         restored_chunks = []
         total_compressed = 0
         total_unpacked = 0
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        enqueue_start = time.perf_counter()
         with nvtx_range("origami:kivi_nvcomp_decompress_cuda"):
-            start_event.record()
             for chunk in layer_payload.chunks:
                 compressed = chunk.compressed.to(
                     "cuda", dtype=torch.uint8, non_blocking=True
@@ -1595,15 +1852,13 @@ class OrigamiConnectorWorker:
                         output_bytes=int(chunk.unpacked_bytes),
                     )
                 )
-            end_event.record()
         symbols = (
             restored_chunks[0].reshape(-1).contiguous()
             if len(restored_chunks) == 1
             else torch.cat([chunk.reshape(-1) for chunk in restored_chunks],
                            dim=0).contiguous()
         )
-        end_event.synchronize()
-        elapsed_ms = float(start_event.elapsed_time(end_event))
+        enqueue_ms = _ms_since(enqueue_start)
         self._write_restore_metric(
             "kivi_nvcomp_decompress_cuda",
             restore,
@@ -1617,17 +1872,8 @@ class OrigamiConnectorWorker:
                 "input_bytes": total_compressed,
                 "output_bytes": total_unpacked,
                 "bytes": total_unpacked,
-                "ms": elapsed_ms,
-                "compressed_gbps": (
-                    total_compressed * 8.0 / elapsed_ms / 1e6
-                    if elapsed_ms > 0.0
-                    else 0.0
-                ),
-                "unpacked_gbps": (
-                    total_unpacked * 8.0 / elapsed_ms / 1e6
-                    if elapsed_ms > 0.0
-                    else 0.0
-                ),
+                "enqueue_ms": enqueue_ms,
+                "cuda_timing_deferred": True,
             },
         )
         return symbols

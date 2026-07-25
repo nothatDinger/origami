@@ -7,10 +7,10 @@ index 0000000..ca8a44e
 +patches/*.patch -whitespace
 diff --git a/csrc/origami/bitpack_layout_cuda.cpp b/csrc/origami/bitpack_layout_cuda.cpp
 new file mode 100644
-index 0000000..bc3c2a1
+index 0000000..2dc866e
 --- /dev/null
 +++ b/csrc/origami/bitpack_layout_cuda.cpp
-@@ -0,0 +1,689 @@
+@@ -0,0 +1,903 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -289,6 +289,41 @@ index 0000000..bc3c2a1
 +    int64_t tokens,
 +    int64_t heads,
 +    int64_t head_dim,
++    cudaStream_t stream);
++
++void origami_fused_prefix_attention_launch(
++    const uint8_t* bytestream,
++    int64_t key_offset,
++    int64_t key_bytes,
++    int64_t value_offset,
++    int64_t value_bytes,
++    int codec,
++    int bits,
++    int64_t group_size,
++    int64_t sink_tokens,
++    const void* key_scale,
++    const void* key_zero,
++    const void* value_scale,
++    const void* value_zero,
++    const void* key_sink,
++    const void* value_sink,
++    const void* query,
++    const void* kv_cache,
++    const int32_t* block_table,
++    void* output,
++    bool query_is_bfloat16,
++    bool cache_is_bfloat16,
++    bool cache_blocks_first,
++    int64_t num_cache_blocks,
++    int64_t block_size,
++    int64_t prefix_tokens,
++    int64_t query_start_position,
++    int64_t sequence_length,
++    int64_t query_tokens,
++    int64_t query_heads,
++    int64_t kv_heads,
++    int64_t head_dim,
++    float softmax_scale,
 +    cudaStream_t stream);
 +
 +at::Tensor unpack_canonical_storage_chunks_cuda(
@@ -691,6 +726,184 @@ index 0000000..bc3c2a1
 +  C10_CUDA_KERNEL_LAUNCH_CHECK();
 +}
 +
++void fused_prefix_attention_cuda(
++    at::Tensor bytestream,
++    int64_t key_offset,
++    int64_t key_bytes,
++    int64_t value_offset,
++    int64_t value_bytes,
++    int64_t codec,
++    int64_t bits,
++    int64_t group_size,
++    int64_t sink_tokens,
++    at::Tensor key_scale,
++    at::Tensor key_zero,
++    at::Tensor value_scale,
++    at::Tensor value_zero,
++    at::Tensor key_sink,
++    at::Tensor value_sink,
++    at::Tensor query,
++    at::Tensor kv_cache,
++    at::Tensor block_table,
++    int64_t prefix_tokens,
++    int64_t query_start_position,
++    int64_t sequence_length,
++    double softmax_scale,
++    at::Tensor output) {
++  check_cuda_contiguous(bytestream, "bytestream");
++  check_cuda_contiguous(key_scale, "key_scale");
++  check_cuda_contiguous(key_zero, "key_zero");
++  check_cuda_contiguous(value_scale, "value_scale");
++  check_cuda_contiguous(value_zero, "value_zero");
++  check_cuda_contiguous(key_sink, "key_sink");
++  check_cuda_contiguous(value_sink, "value_sink");
++  check_cuda_contiguous(query, "query");
++  check_cuda_contiguous(kv_cache, "kv_cache");
++  check_cuda_contiguous(block_table, "block_table");
++  check_cuda_contiguous(output, "output");
++  TORCH_CHECK(bytestream.scalar_type() == at::kByte,
++              "bytestream must be uint8");
++  TORCH_CHECK(codec == 0 || codec == 1,
++              "codec must be 0 (KIVI) or 1 (KVQuant)");
++  TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 8,
++              "fused attention supports 2, 3, 4, or 8 bits");
++  TORCH_CHECK(group_size > 0, "group_size must be positive");
++  TORCH_CHECK(prefix_tokens > 0, "prefix_tokens must be positive");
++  TORCH_CHECK(sink_tokens >= 0 && sink_tokens <= prefix_tokens,
++              "sink_tokens must be in [0, prefix_tokens]");
++  TORCH_CHECK(key_offset >= 0 && key_bytes >= 0 && value_offset >= 0 &&
++                  value_bytes >= 0,
++              "invalid compressed stream offsets");
++  TORCH_CHECK(key_offset + key_bytes <= bytestream.numel() &&
++                  value_offset + value_bytes <= bytestream.numel(),
++              "compressed stream ranges exceed bytestream length");
++  TORCH_CHECK(query.dim() == 3,
++              "query must have shape [query_tokens, query_heads, head_dim]");
++  TORCH_CHECK(output.sizes() == query.sizes(),
++              "output must have the same shape as query");
++  TORCH_CHECK(query.scalar_type() == at::kHalf ||
++                  query.scalar_type() == at::kBFloat16,
++              "query must be float16 or bfloat16");
++  TORCH_CHECK(output.scalar_type() == query.scalar_type(),
++              "output dtype must match query dtype");
++  TORCH_CHECK(kv_cache.scalar_type() == at::kHalf ||
++                  kv_cache.scalar_type() == at::kBFloat16,
++              "kv_cache must be float16 or bfloat16");
++  TORCH_CHECK(block_table.scalar_type() == at::kInt,
++              "block_table must be int32");
++  TORCH_CHECK(block_table.dim() == 1,
++              "block_table must be one-dimensional");
++  TORCH_CHECK(kv_cache.dim() == 5, "kv_cache must have rank 5");
++
++  const auto device = bytestream.device();
++  for (const auto& tensor : {key_scale, key_zero, value_scale, value_zero,
++                             key_sink, value_sink, query, kv_cache,
++                             block_table, output}) {
++    TORCH_CHECK(tensor.device() == device,
++                "all fused-attention tensors must be on the same CUDA device");
++  }
++  for (const auto& tensor : {key_scale, key_zero, value_scale, value_zero,
++                             key_sink, value_sink}) {
++    TORCH_CHECK(tensor.scalar_type() == at::kHalf,
++                "compressed metadata tensors must be float16");
++  }
++
++  const int64_t query_tokens = query.size(0);
++  const int64_t query_heads = query.size(1);
++  const int64_t head_dim = query.size(2);
++  TORCH_CHECK(query_tokens > 0 && query_heads > 0,
++              "query token and head counts must be positive");
++  TORCH_CHECK(head_dim == 128,
++              "the first Origami fused kernel supports head_dim 128 only");
++
++  bool cache_blocks_first = false;
++  int64_t num_cache_blocks = 0;
++  int64_t block_size = 0;
++  int64_t kv_heads = 0;
++  // FlashAttention exposes its paged cache as [2, blocks, block, heads, dim].
++  // Check this layout first because num_cache_blocks == 2 is otherwise
++  // ambiguous with the legacy [blocks, 2, block, heads, dim] representation.
++  if (kv_cache.size(0) == 2) {
++    cache_blocks_first = false;
++    num_cache_blocks = kv_cache.size(1);
++    block_size = kv_cache.size(2);
++    kv_heads = kv_cache.size(3);
++    TORCH_CHECK(kv_cache.size(4) == head_dim,
++                "kv_cache head_dim does not match query");
++  } else if (kv_cache.size(1) == 2) {
++    cache_blocks_first = true;
++    num_cache_blocks = kv_cache.size(0);
++    block_size = kv_cache.size(2);
++    kv_heads = kv_cache.size(3);
++    TORCH_CHECK(kv_cache.size(4) == head_dim,
++                "kv_cache head_dim does not match query");
++  } else {
++    TORCH_CHECK(false,
++                "kv_cache must be [num_blocks,2,block,heads,dim] or "
++                "[2,num_blocks,block,heads,dim]");
++  }
++  TORCH_CHECK(kv_heads > 0 && query_heads % kv_heads == 0,
++              "query_heads must be divisible by kv_heads");
++  TORCH_CHECK(block_size > 0 && num_cache_blocks > 0,
++              "kv_cache block dimensions must be positive");
++  TORCH_CHECK(query_start_position >= prefix_tokens,
++              "query must start at or after the compressed prefix");
++  TORCH_CHECK(sequence_length > 0 &&
++                  query_start_position + query_tokens <= sequence_length,
++              "query range exceeds sequence length");
++  const int64_t logical_blocks =
++      (sequence_length + block_size - 1) / block_size;
++  TORCH_CHECK(block_table.numel() >= logical_blocks,
++              "block_table is too short for sequence_length");
++
++  const int64_t channels = kv_heads * head_dim;
++  const int64_t body_tokens = prefix_tokens - sink_tokens;
++  const auto packed_bytes = [bits](int64_t symbols) {
++    return bits == 3 ? (symbols + 1) / 2 : (symbols * bits + 7) / 8;
++  };
++  const int64_t stream_tokens = codec == 0 ? body_tokens : prefix_tokens;
++  TORCH_CHECK(key_bytes >= packed_bytes(stream_tokens * channels) &&
++                  value_bytes >= packed_bytes(stream_tokens * channels),
++              "compressed K/V streams are smaller than their declared shape");
++  if (codec == 0) {
++    const int64_t key_groups =
++        (body_tokens + group_size - 1) / group_size;
++    const int64_t value_groups =
++        (channels + group_size - 1) / group_size;
++    TORCH_CHECK(key_scale.numel() >= key_groups * channels &&
++                    key_zero.numel() >= key_groups * channels,
++                "KIVI key metadata is too small");
++    TORCH_CHECK(value_scale.numel() >= body_tokens * value_groups &&
++                    value_zero.numel() >= body_tokens * value_groups,
++                "KIVI value metadata is too small");
++    TORCH_CHECK(key_sink.numel() >= sink_tokens * channels &&
++                    value_sink.numel() >= sink_tokens * channels,
++                "KIVI sink tensors are too small");
++  } else {
++    TORCH_CHECK(key_scale.numel() >= channels && key_zero.numel() >= channels,
++                "KVQuant key metadata is too small");
++    TORCH_CHECK(value_scale.numel() >= prefix_tokens &&
++                    value_zero.numel() >= prefix_tokens,
++                "KVQuant value metadata is too small");
++  }
++
++  const c10::cuda::CUDAGuard device_guard(device);
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++  origami_fused_prefix_attention_launch(
++      bytestream.data_ptr<uint8_t>(), key_offset, key_bytes, value_offset,
++      value_bytes, static_cast<int>(codec), static_cast<int>(bits), group_size,
++      sink_tokens, key_scale.data_ptr(), key_zero.data_ptr(),
++      value_scale.data_ptr(), value_zero.data_ptr(), key_sink.data_ptr(),
++      value_sink.data_ptr(), query.data_ptr(), kv_cache.data_ptr(),
++      block_table.data_ptr<int32_t>(), output.data_ptr(),
++      query.scalar_type() == at::kBFloat16,
++      kv_cache.scalar_type() == at::kBFloat16, cache_blocks_first,
++      num_cache_blocks, block_size, prefix_tokens, query_start_position,
++      sequence_length, query_tokens, query_heads, kv_heads, head_dim,
++      static_cast<float>(softmax_scale), stream);
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
 +PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 +  m.def("unpack_canonical_storage_chunks_cuda",
 +        &unpack_canonical_storage_chunks_cuda);
@@ -699,13 +912,14 @@ index 0000000..bc3c2a1
 +        &cachegen_unpack_dequantize_to_kv_cache_cuda);
 +  m.def("kivi_dequantize_to_kv_cache_cuda",
 +        &kivi_dequantize_to_kv_cache_cuda);
++  m.def("fused_prefix_attention_cuda", &fused_prefix_attention_cuda);
 +}
 diff --git a/csrc/origami/bitpack_layout_cuda.cu b/csrc/origami/bitpack_layout_cuda.cu
 new file mode 100644
-index 0000000..d7552b9
+index 0000000..e0f5235
 --- /dev/null
 +++ b/csrc/origami/bitpack_layout_cuda.cu
-@@ -0,0 +1,847 @@
+@@ -0,0 +1,1205 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -1029,6 +1243,12 @@ index 0000000..d7552b9
 +template <>
 +__device__ __forceinline__ float max_to_float_direct<__half>(__half value) {
 +  return __half2float(value);
++}
++
++template <>
++__device__ __forceinline__ float max_to_float_direct<__nv_bfloat16>(
++    __nv_bfloat16 value) {
++  return __bfloat162float(value);
 +}
 +
 +template <typename out_t>
@@ -1552,6 +1772,358 @@ index 0000000..d7552b9
 +        head_dim,
 +        stream);
 +  }
++}
++
++__device__ __forceinline__ uint8_t origami_fused_unpack_symbol(
++    const uint8_t* src,
++    int64_t src_bytes,
++    int64_t symbol_index,
++    int bits) {
++  // The KIVI/KVQuant adapters store 3-bit values in two nibbles per byte
++  // to match the upstream projects' layout. Other widths are densely packed.
++  if (bits == 3) {
++    const int64_t byte_idx = symbol_index >> 1;
++    if (byte_idx >= src_bytes) {
++      return 0;
++    }
++    const int shift = static_cast<int>((symbol_index & 1) * 4);
++    return static_cast<uint8_t>((src[byte_idx] >> shift) & 0x07);
++  }
++  return unpack_symbol_direct(src, src_bytes, symbol_index, bits);
++}
++
++template <typename scalar_t, typename cache_t, int codec>
++__global__ void origami_fused_prefix_attention_kernel(
++    const uint8_t* __restrict__ bytestream,
++    int64_t key_offset,
++    int64_t key_bytes,
++    int64_t value_offset,
++    int64_t value_bytes,
++    int bits,
++    int64_t group_size,
++    int64_t sink_tokens,
++    const __half* __restrict__ key_scale,
++    const __half* __restrict__ key_zero,
++    const __half* __restrict__ value_scale,
++    const __half* __restrict__ value_zero,
++    const __half* __restrict__ key_sink,
++    const __half* __restrict__ value_sink,
++    const scalar_t* __restrict__ query,
++    const cache_t* __restrict__ kv_cache,
++    const int32_t* __restrict__ block_table,
++    scalar_t* __restrict__ output,
++    bool cache_blocks_first,
++    int64_t num_cache_blocks,
++    int64_t block_size,
++    int64_t prefix_tokens,
++    int64_t query_start_position,
++    int64_t sequence_length,
++    int64_t query_tokens,
++    int64_t query_heads,
++    int64_t kv_heads,
++    int64_t head_dim,
++    float softmax_scale) {
++  const int64_t query_token = blockIdx.x;
++  const int64_t query_head = blockIdx.y;
++  const int tid = threadIdx.x;
++  if (query_token >= query_tokens || query_head >= query_heads || tid >= head_dim) {
++    return;
++  }
++
++  // Four warps process a four-token tile. K is read once per warp while all
++  // 128 threads accumulate one output channel each using online softmax.
++  __shared__ float tile_scores[4];
++  __shared__ float tile_weights[4];
++  __shared__ float shared_old_weight;
++  __shared__ float shared_running_max;
++  __shared__ float shared_running_sum;
++  const int64_t kv_head = query_head / (query_heads / kv_heads);
++  const int64_t channels = kv_heads * head_dim;
++  const int64_t body_tokens = prefix_tokens - sink_tokens;
++  const int64_t value_groups =
++      codec == 0 ? (channels + group_size - 1) / group_size : 0;
++  float accumulator = 0.0f;
++  const int64_t causal_end = min(
++      sequence_length - 1, query_start_position + query_token);
++  if (tid == 0) {
++    shared_running_max = -__int_as_float(0x7f800000);
++    shared_running_sum = 0.0f;
++  }
++  __syncthreads();
++
++  const int warp = tid >> 5;
++  const int lane = tid & 31;
++  for (int64_t token_base = 0; token_base <= causal_end; token_base += 4) {
++    const int64_t token = token_base + warp;
++    float dot = 0.0f;
++    if (token <= causal_end) {
++      for (int dim = lane; dim < head_dim; dim += 32) {
++        const int64_t channel = kv_head * head_dim + dim;
++        float key_value = 0.0f;
++        if (token < prefix_tokens) {
++          if (codec == 0) {
++            if (token < sink_tokens) {
++              key_value = __half2float(key_sink[token * channels + channel]);
++            } else {
++              const int64_t body_token = token - sink_tokens;
++              const int64_t symbol_index =
++                  (dim * kv_heads + kv_head) * body_tokens + body_token;
++              const uint8_t symbol = origami_fused_unpack_symbol(
++                  bytestream + key_offset, key_bytes, symbol_index, bits);
++              const int64_t meta_index =
++                  (body_token / group_size) * channels + channel;
++              key_value = static_cast<float>(symbol) *
++                              __half2float(key_scale[meta_index]) +
++                          __half2float(key_zero[meta_index]);
++            }
++          } else {
++            const int64_t symbol_index =
++                (dim * kv_heads + kv_head) * prefix_tokens + token;
++            const uint8_t symbol = origami_fused_unpack_symbol(
++                bytestream + key_offset, key_bytes, symbol_index, bits);
++            key_value = static_cast<float>(symbol) *
++                            __half2float(key_scale[channel]) +
++                        __half2float(key_zero[channel]);
++          }
++        } else {
++          const int64_t logical_block = token / block_size;
++          const int64_t block_offset = token % block_size;
++          const int64_t physical_block = block_table[logical_block];
++          if (physical_block >= 0 && physical_block < num_cache_blocks) {
++            int64_t key_index = 0;
++            if (cache_blocks_first) {
++              key_index = ((((physical_block * 2) * block_size + block_offset) *
++                                kv_heads +
++                            kv_head) *
++                               head_dim +
++                           dim);
++            } else {
++              key_index = (((physical_block * block_size + block_offset) *
++                                kv_heads +
++                            kv_head) *
++                               head_dim +
++                           dim);
++            }
++            key_value = max_to_float_direct(kv_cache[key_index]);
++          }
++        }
++        const float query_value = max_to_float_direct(
++            query[(query_token * query_heads + query_head) * head_dim + dim]);
++        dot += query_value * key_value;
++      }
++    }
++    for (int offset = 16; offset > 0; offset >>= 1) {
++      dot += __shfl_down_sync(0xffffffff, dot, offset);
++    }
++    if (lane == 0) {
++      tile_scores[warp] = token <= causal_end
++                              ? dot * softmax_scale
++                              : -__int_as_float(0x7f800000);
++    }
++    __syncthreads();
++
++    if (tid == 0) {
++      float tile_max = tile_scores[0];
++      for (int index = 1; index < 4; ++index) {
++        tile_max = fmaxf(tile_max, tile_scores[index]);
++      }
++      const float next_max = fmaxf(shared_running_max, tile_max);
++      shared_old_weight = expf(shared_running_max - next_max);
++      float tile_sum = 0.0f;
++      for (int index = 0; index < 4; ++index) {
++        const int64_t tile_token = token_base + index;
++        const float weight = tile_token <= causal_end
++                                 ? expf(tile_scores[index] - next_max)
++                                 : 0.0f;
++        tile_weights[index] = weight;
++        tile_sum += weight;
++      }
++      shared_running_sum =
++          shared_running_sum * shared_old_weight + tile_sum;
++      shared_running_max = next_max;
++    }
++    __syncthreads();
++
++    float tile_accumulator = 0.0f;
++    const int64_t channel = kv_head * head_dim + tid;
++    for (int index = 0; index < 4; ++index) {
++      const int64_t value_token = token_base + index;
++      if (value_token > causal_end) {
++        continue;
++      }
++      float value_value = 0.0f;
++      if (value_token < prefix_tokens) {
++        if (codec == 0) {
++          if (value_token < sink_tokens) {
++            value_value =
++                __half2float(value_sink[value_token * channels + channel]);
++          } else {
++            const int64_t body_token = value_token - sink_tokens;
++            const int64_t symbol_index =
++                (kv_head * head_dim + tid) * body_tokens + body_token;
++            const uint8_t symbol = origami_fused_unpack_symbol(
++                bytestream + value_offset, value_bytes, symbol_index, bits);
++            const int64_t meta_index =
++                body_token * value_groups + channel / group_size;
++            value_value = static_cast<float>(symbol) *
++                              __half2float(value_scale[meta_index]) +
++                          __half2float(value_zero[meta_index]);
++          }
++        } else {
++          const int64_t symbol_index =
++              (kv_head * prefix_tokens + value_token) * head_dim + tid;
++          const uint8_t symbol = origami_fused_unpack_symbol(
++              bytestream + value_offset, value_bytes, symbol_index, bits);
++          value_value = static_cast<float>(symbol) *
++                            __half2float(value_scale[value_token]) +
++                        __half2float(value_zero[value_token]);
++        }
++      } else {
++        const int64_t logical_block = value_token / block_size;
++        const int64_t block_offset = value_token % block_size;
++        const int64_t physical_block = block_table[logical_block];
++        if (physical_block >= 0 && physical_block < num_cache_blocks) {
++          int64_t value_index = 0;
++          if (cache_blocks_first) {
++            value_index = (((((physical_block * 2) + 1) * block_size +
++                              block_offset) *
++                                 kv_heads +
++                             kv_head) *
++                                head_dim +
++                            tid);
++          } else {
++            value_index = ((((num_cache_blocks + physical_block) * block_size +
++                              block_offset) *
++                                 kv_heads +
++                             kv_head) *
++                                head_dim +
++                            tid);
++          }
++          value_value = max_to_float_direct(kv_cache[value_index]);
++        }
++      }
++      tile_accumulator += tile_weights[index] * value_value;
++    }
++    accumulator = accumulator * shared_old_weight + tile_accumulator;
++    __syncthreads();
++  }
++
++  output[(query_token * query_heads + query_head) * head_dim + tid] =
++      float_to_output<scalar_t>(accumulator / shared_running_sum);
++}
++
++template <typename scalar_t, typename cache_t>
++void launch_origami_fused_prefix_attention_typed(
++    const uint8_t* bytestream,
++    int64_t key_offset,
++    int64_t key_bytes,
++    int64_t value_offset,
++    int64_t value_bytes,
++    int codec,
++    int bits,
++    int64_t group_size,
++    int64_t sink_tokens,
++    const __half* key_scale,
++    const __half* key_zero,
++    const __half* value_scale,
++    const __half* value_zero,
++    const __half* key_sink,
++    const __half* value_sink,
++    const scalar_t* query,
++    const cache_t* kv_cache,
++    const int32_t* block_table,
++    scalar_t* output,
++    bool cache_blocks_first,
++    int64_t num_cache_blocks,
++    int64_t block_size,
++    int64_t prefix_tokens,
++    int64_t query_start_position,
++    int64_t sequence_length,
++    int64_t query_tokens,
++    int64_t query_heads,
++    int64_t kv_heads,
++    int64_t head_dim,
++    float softmax_scale,
++    cudaStream_t stream) {
++  const dim3 grid(query_tokens, query_heads);
++  if (codec == 0) {
++    origami_fused_prefix_attention_kernel<scalar_t, cache_t, 0>
++        <<<grid, 128, 0, stream>>>(
++            bytestream, key_offset, key_bytes, value_offset, value_bytes, bits,
++            group_size, sink_tokens, key_scale, key_zero, value_scale,
++            value_zero, key_sink, value_sink, query, kv_cache, block_table,
++            output, cache_blocks_first, num_cache_blocks, block_size,
++            prefix_tokens, query_start_position, sequence_length, query_tokens,
++            query_heads, kv_heads, head_dim, softmax_scale);
++  } else {
++    origami_fused_prefix_attention_kernel<scalar_t, cache_t, 1>
++        <<<grid, 128, 0, stream>>>(
++            bytestream, key_offset, key_bytes, value_offset, value_bytes, bits,
++            group_size, sink_tokens, key_scale, key_zero, value_scale,
++            value_zero, key_sink, value_sink, query, kv_cache, block_table,
++            output, cache_blocks_first, num_cache_blocks, block_size,
++            prefix_tokens, query_start_position, sequence_length, query_tokens,
++            query_heads, kv_heads, head_dim, softmax_scale);
++  }
++}
++
++void origami_fused_prefix_attention_launch(
++    const uint8_t* bytestream,
++    int64_t key_offset,
++    int64_t key_bytes,
++    int64_t value_offset,
++    int64_t value_bytes,
++    int codec,
++    int bits,
++    int64_t group_size,
++    int64_t sink_tokens,
++    const void* key_scale,
++    const void* key_zero,
++    const void* value_scale,
++    const void* value_zero,
++    const void* key_sink,
++    const void* value_sink,
++    const void* query,
++    const void* kv_cache,
++    const int32_t* block_table,
++    void* output,
++    bool query_is_bfloat16,
++    bool cache_is_bfloat16,
++    bool cache_blocks_first,
++    int64_t num_cache_blocks,
++    int64_t block_size,
++    int64_t prefix_tokens,
++    int64_t query_start_position,
++    int64_t sequence_length,
++    int64_t query_tokens,
++    int64_t query_heads,
++    int64_t kv_heads,
++    int64_t head_dim,
++    float softmax_scale,
++    cudaStream_t stream) {
++#define ORIGAMI_LAUNCH_FUSED(QTYPE, CTYPE)                                  \
++  launch_origami_fused_prefix_attention_typed<QTYPE, CTYPE>(                \
++      bytestream, key_offset, key_bytes, value_offset, value_bytes, codec,  \
++      bits, group_size, sink_tokens, static_cast<const __half*>(key_scale), \
++      static_cast<const __half*>(key_zero),                                 \
++      static_cast<const __half*>(value_scale),                              \
++      static_cast<const __half*>(value_zero),                               \
++      static_cast<const __half*>(key_sink),                                 \
++      static_cast<const __half*>(value_sink), static_cast<const QTYPE*>(query), \
++      static_cast<const CTYPE*>(kv_cache), block_table,                     \
++      static_cast<QTYPE*>(output), cache_blocks_first, num_cache_blocks,    \
++      block_size, prefix_tokens, query_start_position, sequence_length,     \
++      query_tokens, query_heads, kv_heads, head_dim, softmax_scale, stream)
++  if (query_is_bfloat16 && cache_is_bfloat16) {
++    ORIGAMI_LAUNCH_FUSED(__nv_bfloat16, __nv_bfloat16);
++  } else if (query_is_bfloat16) {
++    ORIGAMI_LAUNCH_FUSED(__nv_bfloat16, __half);
++  } else if (cache_is_bfloat16) {
++    ORIGAMI_LAUNCH_FUSED(__half, __nv_bfloat16);
++  } else {
++    ORIGAMI_LAUNCH_FUSED(__half, __half);
++  }
++#undef ORIGAMI_LAUNCH_FUSED
 +}
 diff --git a/csrc/origami/qat_deflate.cpp b/csrc/origami/qat_deflate.cpp
 new file mode 100644
@@ -5131,10 +5703,10 @@ index 0000000..58139a4
 +instances.
 diff --git a/docs/usage.md b/docs/usage.md
 new file mode 100644
-index 0000000..5bddc52
+index 0000000..8aafd41
 --- /dev/null
 +++ b/docs/usage.md
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,136 @@
 +# Using Origami
 +
 +This page contains the common commands for checking the environment, validating
@@ -5219,6 +5791,44 @@ index 0000000..5bddc52
 +  "origami_qat_dynamic_huffman": true
 +}
 +```
++
++## Quantized-prefix fused attention
++
++KIVI and KVQuant prefixes can remain compressed on the GPU and be consumed by
++Origami's CUDA online-softmax attention kernel. A mixed batch runs this work on
++a reusable high-priority stream while cold prefill remains on FlashAttention's
++current stream:
++
++```json
++{
++  "origami_quantizer": "kivi",
++  "origami_quantizer_config": {
++    "bits": 4,
++    "group_size": 64,
++    "sink_tokens": 128
++  },
++  "origami_fused_attention": "auto",
++  "origami_fused_execution": "auto",
++  "origami_fused_stream_priority": -1,
++  "origami_cold_prefill_chunk_tokens": 1024,
++  "origami_fused_max_requests": 8,
++  "origami_batch_policy": "restored_priority_mixed"
++}
++```
++
++`origami_fused_attention` defaults to `off`. `auto` falls back to explicit
++dequantization when an artifact or execution mode is incompatible; `required`
++fails startup or restore instead. `origami_fused_execution` accepts `auto`,
++`parallel`, or `serial`. The other batch policies are `restored_only`, which
++does not admit cold prefill while restored work is present, and
++`pure_vllm_baseline`, which disables fused attention and Origami scheduling
++priority.
++
++The first fused implementation requires NVIDIA SM80+, TP/PP/DP/DCP 1,
++FP16/BF16, head size 128, standard Llama or Mistral decoder self-attention, and
++the NHD paged-KV layout. It does not support FP8 KV cache, speculative decoding,
++sliding-window or cross-attention, MLA, or full CUDA Graph execution. Fused
++batches use eager execution; ordinary batches retain the configured graph mode.
 +
 +## Patch Workflow
 +
@@ -5616,10 +6226,10 @@ index 0000000..e9b958e
 +    raise SystemExit(main())
 diff --git a/scripts/export_vllm_patch.sh b/scripts/export_vllm_patch.sh
 new file mode 100755
-index 0000000..e0eb8fd
+index 0000000..da26fd7
 --- /dev/null
 +++ b/scripts/export_vllm_patch.sh
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,99 @@
 +#!/usr/bin/env bash
 +set -euo pipefail
 +
@@ -5628,6 +6238,18 @@ index 0000000..e0eb8fd
 +PATCH_DIR="${ROOT_DIR}/patches"
 +PATCH_FILE="${PATCH_DIR}/origami-vllm-0.18.0.patch"
 +BASE_REF="${ORIGAMI_VLLM_BASE_REF:-a804d94}"
++BASE_WHEEL="${ORIGAMI_VLLM_BASE_WHEEL:-${ROOT_DIR}/vllm-0.18.0-cp38-abi3-manylinux_2_31_x86_64.whl}"
++
++UPSTREAM_FILES=(
++  vllm/v1/attention/backend.py
++  vllm/v1/attention/backends/flash_attn.py
++  vllm/v1/worker/gpu_model_runner.py
++  vllm/v1/worker/gpu/attn_utils.py
++  vllm/v1/worker/gpu/input_batch.py
++  vllm/v1/worker/gpu/model_runner.py
++  vllm/v1/worker/gpu/model_states/default.py
++  vllm/v1/worker/ubatch_utils.py
++)
 +
 +mkdir -p "${PATCH_DIR}"
 +
@@ -5641,7 +6263,10 @@ index 0000000..e0eb8fd
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/benchmark_utils.py \
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/benchmark_connectors.py \
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/native_gpu.py \
-+  vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py
++  vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py \
++  vllm/distributed/kv_transfer/kv_connector/v1/origami/fused_attention.py \
++  tests/v1/kv_connector/unit/test_origami_fused_attention.py \
++  "${UPSTREAM_FILES[@]}"
 +do
 +  if [[ ! -f "${path}" ]]; then
 +    echo "missing expected Origami file: ${path}" >&2
@@ -5659,13 +6284,49 @@ index 0000000..e0eb8fd
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/benchmark_utils.py \
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/benchmark_connectors.py \
 +  vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/native_gpu.py \
-+  vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py
++  vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py \
++  vllm/distributed/kv_transfer/kv_connector/v1/origami/fused_attention.py \
++  tests/v1/kv_connector/unit/test_origami_fused_attention.py
 +
 +git diff --binary "${BASE_REF}" -- . \
 +  ':(exclude)README.md' \
 +  ':(exclude)patches/origami-vllm-0.18.0.patch' > "${PATCH_FILE}"
 +
 +popd >/dev/null
++
++if [[ ! -f "${BASE_WHEEL}" ]]; then
++  echo "missing pristine vLLM wheel: ${BASE_WHEEL}" >&2
++  echo "set ORIGAMI_VLLM_BASE_WHEEL to a vLLM 0.18.0 wheel" >&2
++  exit 2
++fi
++
++TEMP_DIR="$(mktemp -d)"
++trap 'rm -rf "${TEMP_DIR}"' EXIT
++mkdir -p "${TEMP_DIR}/original" "${TEMP_DIR}/modified"
++unzip -q "${BASE_WHEEL}" "${UPSTREAM_FILES[@]}" -d "${TEMP_DIR}/original"
++for path in "${UPSTREAM_FILES[@]}"; do
++  mkdir -p "${TEMP_DIR}/modified/$(dirname "${path}")"
++  cp "${ROOT_DIR}/${path}" "${TEMP_DIR}/modified/${path}"
++done
++
++pushd "${TEMP_DIR}" >/dev/null
++set +e
++git diff --no-index --binary --src-prefix=a/ --dst-prefix=b/ \
++  original modified > upstream.patch
++diff_status=$?
++set -e
++popd >/dev/null
++if [[ "${diff_status}" -gt 1 ]]; then
++  echo "failed to diff upstream vLLM files" >&2
++  exit "${diff_status}"
++fi
++
++sed \
++  -e 's#^diff --git a/original/#diff --git a/#' \
++  -e 's# b/modified/# b/#' \
++  -e 's#^--- a/original/#--- a/#' \
++  -e 's#^+++ b/modified/#+++ b/#' \
++  "${TEMP_DIR}/upstream.patch" >> "${PATCH_FILE}"
 +
 +echo "Wrote ${PATCH_FILE}"
 diff --git a/scripts/run_tests.sh b/scripts/run_tests.sh
@@ -5859,6 +6520,204 @@ index 0000000..0075047
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/tests/v1/kv_connector/unit/test_origami_fused_attention.py b/tests/v1/kv_connector/unit/test_origami_fused_attention.py
+new file mode 100644
+index 0000000..4a1dbe3
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/test_origami_fused_attention.py
+@@ -0,0 +1,192 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import math
++from threading import Lock
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.fused_attention import (
++    FusedLayerPayload,
++    reference_fused_prefix_attention,
++    run_fused_prefix_attention,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.metadata import (
++    OrigamiRestoreRequest,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kivi_adapter import (
++    KiviAdapter,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kvquant_adapter import (
++    KVQuantAdapter,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.worker import (
++    OrigamiConnectorWorker,
++)
++
++pytestmark = pytest.mark.cuda
++
++
++def _run_case(
++    quantizer: str,
++    bits: int,
++    dtype: torch.dtype,
++    query_tokens: int,
++) -> None:
++    torch.manual_seed(1234 + bits + query_tokens)
++    prefix_tokens = 19
++    kv_heads = 2
++    query_heads = 4
++    head_dim = 128
++    if quantizer == "kivi":
++        adapter = KiviAdapter({
++            "bits": bits,
++            "group_size": 7,
++            "sink_tokens": 3,
++            "dequant_device": "cpu",
++        })
++    else:
++        adapter = KVQuantAdapter({"bits": bits, "dequant_device": "cpu"})
++
++    prefix = torch.randn(
++        2, prefix_tokens, kv_heads, head_dim, dtype=dtype
++    )
++    quantized = adapter.quantize(prefix)
++    symbols = quantized.symbols.cuda(non_blocking=True)
++    ready = torch.cuda.Event()
++    ready.record()
++    payload = FusedLayerPayload(
++        request_id="request",
++        cache_key="cache",
++        layer_name="model.layers.0.self_attn.attn",
++        quantizer=quantizer,
++        symbols=symbols,
++        metadata=quantized.metadata,
++        ready_event=ready,
++    )
++
++    sequence_length = prefix_tokens + query_tokens
++    block_size = 16
++    num_blocks = math.ceil(sequence_length / block_size)
++    kv_cache = torch.zeros(
++        2,
++        num_blocks,
++        block_size,
++        kv_heads,
++        head_dim,
++        dtype=dtype,
++        device="cuda",
++    )
++    suffix_key = torch.randn(
++        query_tokens, kv_heads, head_dim, dtype=dtype, device="cuda"
++    )
++    suffix_value = torch.randn_like(suffix_key)
++    for token_index in range(query_tokens):
++        position = prefix_tokens + token_index
++        kv_cache[0, position // block_size, position % block_size] = suffix_key[
++            token_index
++        ]
++        kv_cache[1, position // block_size, position % block_size] = suffix_value[
++            token_index
++        ]
++    block_table = torch.arange(num_blocks, dtype=torch.int32, device="cuda")
++    query = torch.randn(
++        query_tokens, query_heads, head_dim, dtype=dtype, device="cuda"
++    )
++    output = torch.empty_like(query)
++    scale = 1.0 / math.sqrt(head_dim)
++    run_fused_prefix_attention(
++        payload,
++        query=query,
++        kv_cache=kv_cache,
++        block_table=block_table,
++        query_start_position=prefix_tokens,
++        sequence_length=sequence_length,
++        softmax_scale=scale,
++        output=output,
++    )
++    reference = reference_fused_prefix_attention(
++        payload,
++        query=query,
++        kv_cache=kv_cache,
++        block_table=block_table,
++        query_start_position=prefix_tokens,
++        sequence_length=sequence_length,
++        softmax_scale=scale,
++    )
++    tolerance = 1.5e-2 if dtype == torch.float16 else 3e-2
++    torch.testing.assert_close(output, reference, atol=tolerance, rtol=tolerance)
++
++
++@pytest.mark.parametrize(
++    "quantizer,bits",
++    [
++        ("kivi", 2),
++        ("kivi", 3),
++        ("kivi", 4),
++        ("kivi", 8),
++        ("kvquant", 2),
++        ("kvquant", 3),
++        ("kvquant", 4),
++        ("kvquant", 8),
++    ],
++)
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_origami_fused_attention_codecs(quantizer, bits, dtype):
++    _run_case(quantizer, bits, dtype, query_tokens=1)
++
++
++@pytest.mark.parametrize("query_tokens", [16, 128, 1024])
++def test_origami_fused_attention_ragged_query_lengths(query_tokens):
++    _run_case("kivi", 4, torch.float16, query_tokens=query_tokens)
++
++
++def test_origami_fused_payload_refcounts_and_retention():
++    worker = OrigamiConnectorWorker.__new__(OrigamiConnectorWorker)
++    worker.fused_attention_enabled = True
++    worker.quantizer = SimpleNamespace(quantizer_id="kivi")
++    worker.kv_caches = {"layer": torch.empty(0, device="cuda")}
++    worker._fused_lock = Lock()
++    worker._fused_payloads = {}
++    worker._request_fused_keys = {}
++
++    ready = torch.cuda.Event()
++    ready.record()
++    payload = FusedLayerPayload(
++        request_id="request-a",
++        cache_key="cache",
++        layer_name="layer",
++        quantizer="kivi",
++        symbols=torch.empty(1, dtype=torch.uint8, device="cuda"),
++        metadata={"token_count": 1},
++        ready_event=ready,
++    )
++    key = ("cache", "layer", "kivi")
++    worker._fused_payloads[key] = payload
++    worker._request_fused_keys["request-a"] = {"layer": key}
++
++    restore_a = OrigamiRestoreRequest(
++        request_id="request-a",
++        cache_key="cache",
++        block_ids_per_group=((0,),),
++        num_tokens=1,
++    )
++    assert worker._claim_cached_layer_events(restore_a) == {"layer": ready}
++    assert payload.ref_count == 1
++
++    restore_b = OrigamiRestoreRequest(
++        request_id="request-b",
++        cache_key="cache",
++        block_ids_per_group=((1,),),
++        num_tokens=1,
++    )
++    assert worker._claim_cached_layer_events(restore_b) == {"layer": ready}
++    assert payload.ref_count == 2
++
++    worker.release_fused_requests({"request-b"})
++    assert payload.ref_count == 1
++    assert key in worker._fused_payloads
++    worker.release_fused_requests({"request-a"})
++    assert key not in worker._fused_payloads
 diff --git a/vllm/distributed/kv_transfer/kv_connector/factory.py b/vllm/distributed/kv_transfer/kv_connector/factory.py
 index b677c58..45c9140 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/factory.py
@@ -7723,10 +8582,10 @@ index 0000000..a3e9a95
 +    return max(first_start_ts, second_start_ts) < min(first_end_ts, second_end_ts)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/config.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/config.py
 new file mode 100644
-index 0000000..83ea195
+index 0000000..dddc553
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/config.py
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,345 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -7745,6 +8604,8 @@ index 0000000..83ea195
 +OrigamiArtifactFormat = Literal["auto", "bundle_v1", "legacy_pt"]
 +OrigamiDevicePolicy = Literal["auto", "cpu", "gpu", "cuda"]
 +OrigamiNvcompBackend = Literal["disabled", "nvcomp_deflate", "nvcomp_gdeflate"]
++OrigamiFusedAttentionMode = Literal["off", "auto", "required"]
++OrigamiFusedExecutionMode = Literal["auto", "parallel", "serial"]
 +
 +
 +def _get_extra(vllm_config: VllmConfig, key: str, default: Any) -> Any:
@@ -7807,6 +8668,11 @@ index 0000000..83ea195
 +    metrics_dir: str = ""
 +    dequant_device: str = "auto"
 +    bitunpack_device: OrigamiDevicePolicy = "auto"
++    fused_attention: OrigamiFusedAttentionMode = "off"
++    fused_execution: OrigamiFusedExecutionMode = "auto"
++    fused_stream_priority: int = -1
++    cold_prefill_chunk_tokens: int = 1024
++    fused_max_requests: int = 8
 +
 +    @classmethod
 +    def from_vllm_config(cls, vllm_config: VllmConfig) -> "OrigamiConfig":
@@ -7920,6 +8786,21 @@ index 0000000..83ea195
 +            ),
 +            dequant_device=dequant_device,
 +            bitunpack_device=bitunpack_device,
++            fused_attention=str(
++                _get_extra(vllm_config, "origami_fused_attention", "off")
++            ).lower(),
++            fused_execution=str(
++                _get_extra(vllm_config, "origami_fused_execution", "auto")
++            ).lower(),
++            fused_stream_priority=int(
++                _get_extra(vllm_config, "origami_fused_stream_priority", -1)
++            ),
++            cold_prefill_chunk_tokens=int(
++                _get_extra(vllm_config, "origami_cold_prefill_chunk_tokens", 1024)
++            ),
++            fused_max_requests=int(
++                _get_extra(vllm_config, "origami_fused_max_requests", 8)
++            ),
 +        )
 +        config.validate()
 +        return config
@@ -7979,17 +8860,83 @@ index 0000000..83ea195
 +            raise ValueError(
 +                "origami_bitunpack_device must be one of {'auto', 'cpu', 'gpu', 'cuda'}"
 +            )
++        if self.fused_attention not in {"off", "auto", "required"}:
++            raise ValueError(
++                "origami_fused_attention must be one of {'off', 'auto', 'required'}"
++            )
++        if self.fused_execution not in {"auto", "parallel", "serial"}:
++            raise ValueError(
++                "origami_fused_execution must be one of "
++                "{'auto', 'parallel', 'serial'}"
++            )
++        if self.cold_prefill_chunk_tokens <= 0:
++            raise ValueError("origami_cold_prefill_chunk_tokens must be positive")
++        if self.fused_max_requests <= 0:
++            raise ValueError("origami_fused_max_requests must be positive")
 +
 +    def effective_qat_pipeline_target_chunks(self) -> int:
 +        if self.qat_pipeline_target_chunks > 0:
 +            return int(self.qat_pipeline_target_chunks)
 +        return max(1, int(self.qat_max_instances) * 4)
++
++
++def fused_attention_compatibility(
++    vllm_config: VllmConfig,
++    config: OrigamiConfig,
++) -> tuple[bool, str]:
++    """Return whether the first-generation Origami fused path is supported.
++
++    Device capability is checked by the worker after CUDA initialization.  The
++    checks here deliberately fail closed for execution modes that require
++    cross-rank attention state or change the paged-cache semantics.
++    """
++    if config.fused_attention == "off":
++        return False, "origami_fused_attention is off"
++    if config.quantizer not in {"kivi", "kvquant"}:
++        return False, "fused attention supports only kivi and kvquant"
++    if config.batch_policy == "pure_vllm_baseline":
++        return False, "pure_vllm_baseline disables Origami fused attention"
++
++    parallel = vllm_config.parallel_config
++    if int(parallel.tensor_parallel_size) != 1:
++        return False, "fused attention currently requires tensor_parallel_size=1"
++    if int(parallel.pipeline_parallel_size) != 1:
++        return False, "fused attention currently requires pipeline_parallel_size=1"
++    if int(parallel.data_parallel_size) != 1:
++        return False, "fused attention currently requires data_parallel_size=1"
++    if int(parallel.decode_context_parallel_size) != 1:
++        return False, "fused attention does not support decode context parallelism"
++    if vllm_config.speculative_config is not None:
++        return False, "fused attention does not support speculative decoding"
++
++    model = vllm_config.model_config
++    if model.is_encoder_decoder:
++        return False, "fused attention does not support cross-attention"
++    if model.use_mla:
++        return False, "fused attention does not support MLA"
++
++    cache_dtype = str(vllm_config.cache_config.cache_dtype)
++    if cache_dtype.startswith("fp8"):
++        return False, "fused attention does not support FP8 KV cache"
++    if vllm_config.cache_config.sliding_window is not None:
++        return False, "fused attention does not support sliding-window attention"
++
++    dtype = str(vllm_config.model_config.dtype).replace("torch.", "")
++    if dtype not in {"float16", "bfloat16"}:
++        return False, "fused attention requires float16 or bfloat16 activations"
++    if int(vllm_config.model_config.get_head_size()) != 128:
++        return False, "fused attention currently requires head_size=128"
++
++    model_type = str(getattr(vllm_config.model_config.hf_config, "model_type", ""))
++    if model_type not in {"llama", "mistral"}:
++        return False, "fused attention currently supports Llama and Mistral models"
++    return True, ""
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/connector.py
 new file mode 100644
-index 0000000..98193a7
+index 0000000..6819d03
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/connector.py
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,257 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -8006,6 +8953,9 @@ index 0000000..98193a7
 +)
 +from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import OrigamiConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import (
++    fused_attention_compatibility,
++)
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.metadata import (
 +    OrigamiConnectorMetadata,
 +)
@@ -8031,6 +8981,19 @@ index 0000000..98193a7
 +
 +class OrigamiConnector(KVConnectorBase_V1, SupportsHMA):
 +
++    @classmethod
++    def get_required_kvcache_layout(
++        cls, vllm_config: "VllmConfig"
++    ) -> str | None:
++        kv_config = vllm_config.kv_transfer_config
++        extra = (
++            kv_config.kv_connector_extra_config
++            if kv_config is not None
++            else None
++        ) or {}
++        mode = str(extra.get("origami_fused_attention", "off")).lower()
++        return "NHD" if mode != "off" else None
++
 +    def __init__(
 +        self,
 +        vllm_config: "VllmConfig",
@@ -8039,6 +9002,12 @@ index 0000000..98193a7
 +    ):
 +        super().__init__(vllm_config, role, kv_cache_config)
 +        self.config = OrigamiConfig.from_vllm_config(vllm_config)
++        fused_supported, fused_reason = fused_attention_compatibility(
++            vllm_config, self.config
++        )
++        if self.config.fused_attention == "required" and not fused_supported:
++            raise ValueError(f"Origami fused attention is required: {fused_reason}")
++        self.fused_attention_enabled = fused_supported
 +        self.store = create_origami_store(
 +            self.config.store_uri,
 +            artifact_format=self.config.artifact_format,
@@ -8065,7 +9034,13 @@ index 0000000..98193a7
 +                    system="origami",
 +                )
 +            self.connector_worker = OrigamiConnectorWorker(
-+                self.config, self.store, kv_cache_config
++                self.config,
++                self.store,
++                kv_cache_config,
++                fused_attention_enabled=self.fused_attention_enabled,
++            )
++            self.fused_attention_enabled = (
++                self.connector_worker.fused_attention_enabled
 +            )
 +
 +    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -8098,10 +9073,62 @@ index 0000000..98193a7
 +        self.connector_worker.wait_for_save()
 +
 +    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-+        del finished_req_ids
 +        if self.connector_worker is None:
 +            return set(), set()
++        if finished_req_ids:
++            self.connector_worker.release_fused_requests(finished_req_ids)
 +        return self.connector_worker.get_finished()
++
++    def get_fused_layer_payloads(
++        self,
++        layer_name: str,
++        request_ids: tuple[str, ...] | list[str],
++    ):
++        if self.connector_worker is None or not self.fused_attention_enabled:
++            return {}
++        return self.connector_worker.get_fused_layer_payloads(
++            layer_name, request_ids
++        )
++
++    def get_fused_attention_runtime_config(self) -> dict[str, Any]:
++        return {
++            "enabled": self.fused_attention_enabled,
++            "mode": self.config.fused_attention,
++            "execution": self.config.fused_execution,
++            "stream_priority": self.config.fused_stream_priority,
++            "max_requests": self.config.fused_max_requests,
++        }
++
++    def get_fused_batch_metadata(self):
++        metadata = self._connector_metadata
++        if not isinstance(metadata, OrigamiConnectorMetadata):
++            return {}, {}
++        return (
++            metadata.fused_query_start_positions,
++            metadata.fused_query_token_counts,
++        )
++
++    def get_fused_request_descriptors(self) -> dict[str, dict[str, Any]]:
++        metadata = self._connector_metadata
++        if not isinstance(metadata, OrigamiConnectorMetadata):
++            return {}
++        return {
++            request_id: {
++                "request_index": metadata.fused_request_indices[request_id],
++                "codec": metadata.fused_codecs[request_id],
++                "prefix_length": metadata.fused_prefix_lengths[request_id],
++                "query_start_position": (
++                    metadata.fused_query_start_positions[request_id]
++                ),
++                "query_token_count": metadata.fused_query_token_counts[request_id],
++            }
++            for request_id in metadata.fused_request_ids
++        }
++
++    def get_fused_attention_stream_state(self):
++        if self.connector_worker is None:
++            return None
++        return self.connector_worker.get_fused_attention_stream_state()
 +
 +    def get_num_new_matched_tokens(
 +        self,
@@ -8167,6 +9194,156 @@ index 0000000..98193a7
 +        assert self.connector_scheduler is not None
 +        self.connector_scheduler.request_finished(request)
 +        return False, None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/fused_attention.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/fused_attention.py
+new file mode 100644
+index 0000000..e6adc04
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/fused_attention.py
+@@ -0,0 +1,144 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++
++@dataclass
++class FusedLayerPayload:
++    """GPU-resident compressed prefix for one Origami cache layer."""
++
++    request_id: str
++    cache_key: str
++    layer_name: str
++    quantizer: str
++    symbols: torch.Tensor
++    metadata: dict[str, Any]
++    ready_event: torch.cuda.Event
++    ref_count: int = 1
++
++    @property
++    def prefix_tokens(self) -> int:
++        return int(self.metadata["token_count"])
++
++
++def run_fused_prefix_attention(
++    payload: FusedLayerPayload,
++    *,
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_position: int,
++    sequence_length: int,
++    softmax_scale: float,
++    output: torch.Tensor,
++) -> None:
++    """Launch an Origami fused online-softmax attention kernel."""
++    from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import (
++        native_gpu,
++    )
++
++    metadata = payload.metadata
++    if payload.quantizer == "kivi":
++        native_gpu.kivi_fused_prefix_attention(
++            payload.symbols,
++            metadata=metadata,
++            query=query,
++            kv_cache=kv_cache,
++            block_table=block_table,
++            query_start_position=query_start_position,
++            sequence_length=sequence_length,
++            softmax_scale=softmax_scale,
++            output=output,
++        )
++        return
++    if payload.quantizer == "kvquant":
++        native_gpu.kvquant_fused_prefix_attention(
++            payload.symbols,
++            metadata=metadata,
++            query=query,
++            kv_cache=kv_cache,
++            block_table=block_table,
++            query_start_position=query_start_position,
++            sequence_length=sequence_length,
++            softmax_scale=softmax_scale,
++            output=output,
++        )
++        return
++    raise ValueError(f"Unsupported Origami fused quantizer {payload.quantizer!r}")
++
++
++def reference_fused_prefix_attention(
++    payload: FusedLayerPayload,
++    *,
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_position: int,
++    sequence_length: int,
++    softmax_scale: float,
++) -> torch.Tensor:
++    """Slow explicit-dequantization reference used only by tests."""
++    from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kivi_adapter import (
++        KiviAdapter,
++    )
++    from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kvquant_adapter import (
++        KVQuantAdapter,
++    )
++
++    metadata = payload.metadata
++    symbols_cpu = payload.symbols.detach().cpu()
++    if payload.quantizer == "kivi":
++        adapter = KiviAdapter({
++            "bits": int(metadata["bits"]),
++            "group_size": int(metadata["group_size"]),
++            "sink_tokens": int(metadata["sink_tokens"]),
++            "dequant_device": "cpu",
++        })
++    elif payload.quantizer == "kvquant":
++        adapter = KVQuantAdapter({
++            "bits": int(metadata["bits"]),
++            "dequant_device": "cpu",
++        })
++    else:
++        raise ValueError(f"Unsupported Origami fused quantizer {payload.quantizer!r}")
++    restored = adapter.dequantize(symbols_cpu, metadata)
++    canonical, _ = KiviAdapter._canonicalize(restored)
++    prefix_key = canonical[0].to(device=query.device, dtype=query.dtype)
++    prefix_value = canonical[1].to(device=query.device, dtype=query.dtype)
++
++    if kv_cache.dim() != 5 or kv_cache.shape[0] != 2:
++        raise ValueError("reference path expects [2, blocks, block, heads, dim]")
++    block_size = int(kv_cache.shape[2])
++    suffix_keys = []
++    suffix_values = []
++    for token in range(payload.prefix_tokens, sequence_length):
++        logical_block = token // block_size
++        block_offset = token % block_size
++        physical_block = int(block_table[logical_block].item())
++        suffix_keys.append(kv_cache[0, physical_block, block_offset])
++        suffix_values.append(kv_cache[1, physical_block, block_offset])
++    if suffix_keys:
++        key = torch.cat([prefix_key, torch.stack(suffix_keys)], dim=0)
++        value = torch.cat([prefix_value, torch.stack(suffix_values)], dim=0)
++    else:
++        key = prefix_key
++        value = prefix_value
++
++    repeats = query.shape[1] // key.shape[1]
++    key = key.repeat_interleave(repeats, dim=1).float()
++    value = value.repeat_interleave(repeats, dim=1).float()
++    scores = torch.einsum("qhd,thd->qht", query.float(), key)
++    scores.mul_(float(softmax_scale))
++    key_positions = torch.arange(key.shape[0], device=query.device)
++    causal_ends = query_start_position + torch.arange(
++        query.shape[0], device=query.device
++    )
++    scores.masked_fill_(key_positions[None, None, :] > causal_ends[:, None, None],
++                        float("-inf"))
++    probabilities = torch.softmax(scores, dim=-1)
++    return torch.einsum("qht,thd->qhd", probabilities, value).to(query.dtype)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/__init__.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/__init__.py
 new file mode 100644
 index 0000000..1584c6c
@@ -9388,10 +10565,10 @@ index 0000000..41aa2f0
 +    return profile
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/native_gpu.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/native_gpu.py
 new file mode 100644
-index 0000000..7844f1e
+index 0000000..b321062
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/native_gpu.py
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,424 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -9431,14 +10608,14 @@ index 0000000..7844f1e
 +    if not torch.cuda.is_available():
 +        raise RuntimeError("Origami CUDA bitpack extension requires CUDA")
 +    return load(
-+        name="origami_bitpack_cuda_v5",
++        name="origami_bitpack_cuda_v6",
 +        sources=[
 +            str(_CSRC / "bitpack_layout_cuda.cpp"),
 +            str(_CSRC / "bitpack_layout_cuda.cu"),
 +        ],
 +        extra_cflags=["-O3"],
 +        extra_cuda_cflags=["-O3"],
-+        build_directory=_build_dir("bitpack_cuda_v5"),
++        build_directory=_build_dir("bitpack_cuda_v6"),
 +        verbose=_VERBOSE,
 +    )
 +
@@ -9653,6 +10830,169 @@ index 0000000..7844f1e
 +        int(heads),
 +        int(head_dim),
 +    )
++
++
++def _fp16_blob_view(
++    bytestream: torch.Tensor,
++    metadata: dict[str, Any],
++    name: str,
++) -> torch.Tensor:
++    offset = int(metadata[f"{name}_offset"])
++    numel = int(metadata[f"{name}_numel"])
++    byte_count = numel * torch.empty((), dtype=torch.float16).element_size()
++    if offset < 0 or offset + byte_count > int(bytestream.numel()):
++        raise ValueError(f"{name} range exceeds the Origami artifact")
++    if offset % 2:
++        raise ValueError(f"{name} must be aligned for float16 access")
++    return bytestream.narrow(0, offset, byte_count).view(torch.float16)
++
++
++def _fused_prefix_attention(
++    bytestream: torch.Tensor,
++    *,
++    codec: int,
++    metadata: dict[str, Any],
++    key_scale: torch.Tensor,
++    key_zero: torch.Tensor,
++    value_scale: torch.Tensor,
++    value_zero: torch.Tensor,
++    key_sink: torch.Tensor,
++    value_sink: torch.Tensor,
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_position: int,
++    sequence_length: int,
++    softmax_scale: float,
++    output: torch.Tensor,
++) -> None:
++    if bytestream.device != query.device or query.device != kv_cache.device:
++        raise ValueError("compressed payload, query, and KV cache must share a device")
++    if query.ndim != 3 or output.shape != query.shape:
++        raise ValueError("query and output must be matching rank-3 tensors")
++    if kv_cache.ndim != 5 or int(kv_cache.shape[0]) != 2:
++        raise ValueError(
++            "fused attention requires NHD KV cache shape "
++            "[2, blocks, block, heads, dim]"
++        )
++    if int(metadata["head_dim"]) != int(query.shape[2]):
++        raise ValueError("artifact head_dim does not match query")
++    if int(metadata["num_heads"]) != int(kv_cache.shape[3]):
++        raise ValueError("artifact KV head count does not match KV cache")
++    if int(kv_cache.shape[4]) != int(query.shape[2]):
++        raise ValueError("KV cache head_dim does not match query")
++    declared_bytes = int(metadata.get("symbol_byte_count", bytestream.numel()))
++    if declared_bytes != int(bytestream.numel()):
++        raise ValueError("artifact byte count does not match compressed payload")
++    if int(query_start_position) < int(metadata["token_count"]):
++        raise ValueError("query starts inside the compressed prefix")
++    ext = load_bitpack_cuda_extension()
++    ext.fused_prefix_attention_cuda(
++        bytestream.reshape(-1).contiguous(),
++        int(metadata["key_stream_offset"]),
++        int(metadata["key_stream_bytes"]),
++        int(metadata["value_stream_offset"]),
++        int(metadata["value_stream_bytes"]),
++        int(codec),
++        int(metadata["bits"]),
++        int(metadata.get("group_size", 1)),
++        int(metadata.get("sink_tokens", 0)),
++        key_scale.contiguous(),
++        key_zero.contiguous(),
++        value_scale.contiguous(),
++        value_zero.contiguous(),
++        key_sink.contiguous(),
++        value_sink.contiguous(),
++        query.contiguous(),
++        kv_cache,
++        block_table.to(device=kv_cache.device, dtype=torch.int32).contiguous(),
++        int(metadata["token_count"]),
++        int(query_start_position),
++        int(sequence_length),
++        float(softmax_scale),
++        output,
++    )
++
++
++def kivi_fused_prefix_attention(
++    bytestream: torch.Tensor,
++    *,
++    metadata: dict[str, Any],
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_position: int,
++    sequence_length: int,
++    softmax_scale: float,
++    output: torch.Tensor,
++) -> None:
++    if str(metadata.get("format")) != "kivi_structured_blob":
++        raise ValueError("KIVI fused attention requires a structured KIVI artifact")
++    if tuple(metadata.get("key_order", ())) != (
++        "head_dim", "layer", "head", "token"
++    ) or tuple(metadata.get("value_order", ())) != (
++        "head", "layer", "head_dim", "token"
++    ):
++        raise ValueError("KIVI artifact has an unsupported packed layout")
++    _fused_prefix_attention(
++        bytestream,
++        codec=0,
++        metadata=metadata,
++        key_scale=_fp16_blob_view(bytestream, metadata, "key_scale"),
++        key_zero=_fp16_blob_view(bytestream, metadata, "key_zero"),
++        value_scale=_fp16_blob_view(bytestream, metadata, "value_scale"),
++        value_zero=_fp16_blob_view(bytestream, metadata, "value_zero"),
++        key_sink=_fp16_blob_view(bytestream, metadata, "key_sink"),
++        value_sink=_fp16_blob_view(bytestream, metadata, "value_sink"),
++        query=query,
++        kv_cache=kv_cache,
++        block_table=block_table,
++        query_start_position=query_start_position,
++        sequence_length=sequence_length,
++        softmax_scale=softmax_scale,
++        output=output,
++    )
++
++
++def kvquant_fused_prefix_attention(
++    bytestream: torch.Tensor,
++    *,
++    metadata: dict[str, Any],
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_start_position: int,
++    sequence_length: int,
++    softmax_scale: float,
++    output: torch.Tensor,
++) -> None:
++    if str(metadata.get("format")) != "kvquant_structured_blob":
++        raise ValueError("KVQuant fused attention requires a structured artifact")
++    if tuple(metadata.get("key_order", ())) != (
++        "head_dim", "layer", "head", "token"
++    ) or tuple(metadata.get("value_order", ())) != (
++        "layer", "head", "token", "head_dim"
++    ):
++        raise ValueError("KVQuant artifact has an unsupported packed layout")
++    empty = torch.empty((0,), dtype=torch.float16, device=bytestream.device)
++    _fused_prefix_attention(
++        bytestream,
++        codec=1,
++        metadata=metadata,
++        key_scale=_fp16_blob_view(bytestream, metadata, "key_scale"),
++        key_zero=_fp16_blob_view(bytestream, metadata, "key_min"),
++        value_scale=_fp16_blob_view(bytestream, metadata, "value_scale"),
++        value_zero=_fp16_blob_view(bytestream, metadata, "value_min"),
++        key_sink=empty,
++        value_sink=empty,
++        query=query,
++        kv_cache=kv_cache,
++        block_table=block_table,
++        query_start_position=query_start_position,
++        sequence_length=sequence_length,
++        softmax_scale=softmax_scale,
++        output=output,
++    )
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/pipeline.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/lossless/pipeline.py
 new file mode 100644
 index 0000000..dcd500e
@@ -9679,10 +11019,10 @@ index 0000000..dcd500e
 +    return set(sorted(request_ids)[:count])
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/metadata.py
 new file mode 100644
-index 0000000..53bec9d
+index 0000000..16e8b70
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/metadata.py
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,92 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -9769,6 +11109,12 @@ index 0000000..53bec9d
 +    reqs_to_restore: dict[str, OrigamiRestoreRequest] = field(default_factory=dict)
 +    reqs_to_save: dict[str, OrigamiSaveRequest] = field(default_factory=dict)
 +    gpu_lossless_ratio: int = 0
++    fused_request_ids: tuple[str, ...] = ()
++    fused_query_start_positions: dict[str, int] = field(default_factory=dict)
++    fused_query_token_counts: dict[str, int] = field(default_factory=dict)
++    fused_request_indices: dict[str, int] = field(default_factory=dict)
++    fused_codecs: dict[str, str] = field(default_factory=dict)
++    fused_prefix_lengths: dict[str, int] = field(default_factory=dict)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/__init__.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/__init__.py
 new file mode 100644
 index 0000000..f1707b0
@@ -10795,10 +12141,10 @@ index 0000000..f9d410b
 +        return tensor
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py
 new file mode 100644
-index 0000000..cdc262d
+index 0000000..7333c03
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kivi_adapter.py
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,733 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -10837,6 +12183,11 @@ index 0000000..cdc262d
 +            vals = torch.cat([vals, torch.zeros(1, dtype=torch.uint8)])
 +        pairs = vals.reshape(-1, 2)
 +        return (pairs[:, 0] | (pairs[:, 1] << 4)).contiguous()
++    if bits == 3:
++        if vals.numel() % 2:
++            vals = torch.cat([vals, torch.zeros(1, dtype=torch.uint8)])
++        pairs = vals.reshape(-1, 2)
++        return ((pairs[:, 0] & 0x07) | ((pairs[:, 1] & 0x07) << 4)).contiguous()
 +    if bits == 2:
 +        pad = (-int(vals.numel())) % 4
 +        if pad:
@@ -10848,7 +12199,7 @@ index 0000000..cdc262d
 +            | ((groups[:, 2] & 0x03) << 4)
 +            | ((groups[:, 3] & 0x03) << 6)
 +        ).contiguous()
-+    raise ValueError("KIVI adapter supports only 2, 4, or 8 bit packing")
++    raise ValueError("KIVI adapter supports only 2, 3, 4, or 8 bit packing")
 +
 +
 +def _unpack_lowbit_values(
@@ -10869,6 +12220,12 @@ index 0000000..cdc262d
 +        out[0::2] = src.cpu() & 0x0F
 +        out[1::2] = (src.cpu() >> 4) & 0x0F
 +        return out[:count].contiguous().to(device=device)
++    if bits == 3:
++        out = torch.empty((int(src.numel()) * 2,), dtype=torch.uint8)
++        src_cpu = src.cpu()
++        out[0::2] = src_cpu & 0x07
++        out[1::2] = (src_cpu >> 4) & 0x07
++        return out[:count].contiguous().to(device=device)
 +    if bits == 2:
 +        out = torch.empty((int(src.numel()) * 4,), dtype=torch.uint8)
 +        src_cpu = src.cpu()
@@ -10877,7 +12234,7 @@ index 0000000..cdc262d
 +        out[2::4] = (src_cpu >> 4) & 0x03
 +        out[3::4] = (src_cpu >> 6) & 0x03
 +        return out[:count].contiguous().to(device=device)
-+    raise ValueError("KIVI adapter supports only 2, 4, or 8 bit packing")
++    raise ValueError("KIVI adapter supports only 2, 3, 4, or 8 bit packing")
 +
 +
 +def _pack_ordered_lowbit(
@@ -10934,8 +12291,8 @@ index 0000000..cdc262d
 +        )
 +        self.dequant_device = str(self.config.get("dequant_device", "auto")).lower()
 +        self.last_profile: list[dict[str, Any]] = []
-+        if self.bits not in {2, 4, 8}:
-+            raise ValueError("KiviAdapter bits must be one of {2, 4, 8}")
++        if self.bits not in {2, 3, 4, 8}:
++            raise ValueError("KiviAdapter bits must be one of {2, 3, 4, 8}")
 +        if self.group_size <= 0:
 +            raise ValueError("KiviAdapter group_size must be positive")
 +        if self.sink_tokens < 0:
@@ -11523,21 +12880,264 @@ index 0000000..cdc262d
 +        return tensor
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kvquant_adapter.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kvquant_adapter.py
 new file mode 100644
-index 0000000..200db39
+index 0000000..5cfbf4e
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/kvquant_adapter.py
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,254 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
 +
-+from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.raw_tensor import (
-+    TorchSerializedTensorAdapter,
++from typing import Any
++
++import torch
++
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.base import (
++    QuantizedKV,
++    QuantizerAdapter,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kivi_adapter import (
++    KiviAdapter,
++    _pack_ordered_lowbit,
++    _unpack_ordered_lowbit,
 +)
 +
++KVQUANT_KEY_ORDER = ("head_dim", "layer", "head", "token")
++KVQUANT_VALUE_ORDER = ("layer", "head", "token", "head_dim")
 +
-+class KVQuantAdapter(TorchSerializedTensorAdapter):
++
++def _dtype_from_metadata(metadata: dict[str, Any]) -> torch.dtype:
++    dtype_name = str(metadata.get("dtype", "float16")).replace("torch.", "")
++    dtype = getattr(torch, dtype_name, None)
++    if not isinstance(dtype, torch.dtype):
++        raise ValueError(f"Unsupported KVQuant tensor dtype {dtype_name!r}")
++    return dtype
++
++
++def _quant_minmax_codes(
++    matrix: torch.Tensor,
++    *,
++    dim: int,
++    bits: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    levels = float((1 << int(bits)) - 1)
++    minv = torch.amin(matrix, dim=dim, keepdim=True)
++    maxv = torch.amax(matrix, dim=dim, keepdim=True)
++    scale = torch.clamp((maxv - minv) / levels, min=torch.finfo(torch.float32).tiny)
++    q = torch.round((matrix - minv) / scale).clamp_(0, levels).to(torch.uint8)
++    return (
++        q.contiguous(),
++        minv.squeeze(dim).to(torch.float16).contiguous(),
++        scale.squeeze(dim).to(torch.float16).contiguous(),
++    )
++
++
++def _fp16_bytes(tensor: torch.Tensor) -> torch.Tensor:
++    return (
++        tensor.detach()
++        .cpu()
++        .to(torch.float16)
++        .contiguous()
++        .view(torch.uint8)
++        .reshape(-1)
++    )
++
++
++def _read_fp16(raw: torch.Tensor, offset: int, numel: int) -> torch.Tensor:
++    return (
++        raw.narrow(0, int(offset), int(numel) * 2)
++        .contiguous()
++        .view(torch.float16)
++    )
++
++
++def _canonical_to_matrices(canonical: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    tokens = int(canonical.shape[1])
++    heads = int(canonical.shape[2])
++    head_dim = int(canonical.shape[3])
++    key = canonical[0].reshape(tokens, heads * head_dim).float()
++    value = canonical[1].reshape(tokens, heads * head_dim).float()
++    return key, value
++
++
++class KVQuantAdapter(QuantizerAdapter):
++    """KVQuant-style 2-bit min/max KV quantizer.
++
++    This adapter intentionally stops after quantization.  It emits one flat
++    uint8 payload containing packed low-bit key/value streams and fp16 metadata;
++    any lossless stage is outside this adapter and can be bypassed with the raw
++    Origami backend for quality-only tests.
++    """
++
 +    quantizer_id = "kvquant"
++
++    def __init__(self, config: dict[str, Any] | None = None):
++        super().__init__(config)
++        self.bits = int(self.config.get("bits", self.config.get("kvquant_bits", 2)))
++        if self.bits not in {2, 3, 4, 8}:
++            raise ValueError("KVQuantAdapter bits must be one of {2, 3, 4, 8}")
++
++    def quantize(
++        self,
++        kv: torch.Tensor,
++        *,
++        request: Any | None = None,
++        layer_group: Any | None = None,
++        stream: Any | None = None,
++    ) -> QuantizedKV:
++        del request, layer_group, stream
++        canonical, layout = KiviAdapter._canonicalize(kv)
++        canonical_cpu = canonical.detach().cpu().to(torch.float16).contiguous()
++        tokens = int(canonical_cpu.shape[1])
++        heads = int(canonical_cpu.shape[2])
++        head_dim = int(canonical_cpu.shape[3])
++        cols = heads * head_dim
++
++        key_matrix, value_matrix = _canonical_to_matrices(canonical_cpu)
++        key_q, key_min, key_scale = _quant_minmax_codes(
++            key_matrix, dim=0, bits=self.bits
++        )
++        value_q, value_min, value_scale = _quant_minmax_codes(
++            value_matrix, dim=1, bits=self.bits
++        )
++
++        data_shape = (1, tokens, heads, head_dim)
++        key_stream = _pack_ordered_lowbit(
++            key_q.reshape(data_shape), KVQUANT_KEY_ORDER, self.bits
++        )
++        value_stream = _pack_ordered_lowbit(
++            value_q.reshape(data_shape), KVQUANT_VALUE_ORDER, self.bits
++        )
++
++        parts: list[torch.Tensor] = []
++        offsets: dict[str, int] = {}
++        cursor = 0
++        for name, part in (
++            ("key_stream", key_stream),
++            ("value_stream", value_stream),
++            ("key_min", _fp16_bytes(key_min)),
++            ("key_scale", _fp16_bytes(key_scale)),
++            ("value_min", _fp16_bytes(value_min)),
++            ("value_scale", _fp16_bytes(value_scale)),
++        ):
++            if name.endswith(("min", "scale")) and cursor % 2:
++                parts.append(torch.zeros((1,), dtype=torch.uint8))
++                cursor += 1
++            offsets[name] = cursor
++            flat = part.detach().cpu().to(torch.uint8).reshape(-1).contiguous()
++            parts.append(flat)
++            cursor += int(flat.numel())
++        symbols = torch.cat(parts, dim=0).contiguous()
++
++        metadata: dict[str, Any] = {
++            "format": "kvquant_structured_blob",
++            "version": 1,
++            "bits": self.bits,
++            "dtype": str(kv.dtype).replace("torch.", ""),
++            "shape": [int(dim) for dim in kv.shape],
++            "kv_layout": layout,
++            "token_count": tokens,
++            "num_heads": heads,
++            "head_dim": head_dim,
++            "channel_count": cols,
++            "data_shape": list(data_shape),
++            "key_order": list(KVQUANT_KEY_ORDER),
++            "value_order": list(KVQUANT_VALUE_ORDER),
++            "key_stream_bytes": int(key_stream.numel()),
++            "value_stream_bytes": int(value_stream.numel()),
++            "key_min_numel": int(key_min.numel()),
++            "key_scale_numel": int(key_scale.numel()),
++            "value_min_numel": int(value_min.numel()),
++            "value_scale_numel": int(value_scale.numel()),
++            "symbol_byte_count": int(symbols.numel()),
++            "origami_bits": 8,
++            "origami_symbol_shape": [1, 1, int(symbols.numel())],
++            "origami_symbol_layout": ["token", "head", "head_dim"],
++        }
++        for name, offset in offsets.items():
++            metadata[f"{name}_offset"] = int(offset)
++        return QuantizedKV(symbols=symbols, metadata=metadata)
++
++    def dequantize(
++        self,
++        symbols: torch.Tensor,
++        metadata: dict[str, Any],
++        *,
++        dst_cache: torch.Tensor | None = None,
++        block_ids: list[int] | tuple[int, ...] | None = None,
++        stream: Any | None = None,
++    ) -> torch.Tensor | Any:
++        del stream
++        if str(metadata.get("format")) != "kvquant_structured_blob":
++            raise ValueError("KVQuantAdapter can only dequantize KVQuant payloads")
++        raw = symbols.detach().cpu().to(torch.uint8).reshape(-1).contiguous()
++        expected = int(metadata["symbol_byte_count"])
++        if int(raw.numel()) != expected:
++            raise RuntimeError(
++                f"KVQuant payload size mismatch: got {int(raw.numel())}, expected {expected}"
++            )
++
++        tokens = int(metadata["token_count"])
++        heads = int(metadata["num_heads"])
++        head_dim = int(metadata["head_dim"])
++        cols = heads * head_dim
++        bits = int(metadata["bits"])
++        data_shape = tuple(int(dim) for dim in metadata["data_shape"])
++
++        key_stream = raw.narrow(
++            0, int(metadata["key_stream_offset"]), int(metadata["key_stream_bytes"])
++        )
++        value_stream = raw.narrow(
++            0, int(metadata["value_stream_offset"]), int(metadata["value_stream_bytes"])
++        )
++        key_q = _unpack_ordered_lowbit(
++            key_stream,
++            shape=data_shape,
++            order=tuple(metadata["key_order"]),
++            bits=bits,
++        ).reshape(tokens, cols)
++        value_q = _unpack_ordered_lowbit(
++            value_stream,
++            shape=data_shape,
++            order=tuple(metadata["value_order"]),
++            bits=bits,
++        ).reshape(tokens, cols)
++
++        key_min = _read_fp16(
++            raw, int(metadata["key_min_offset"]), int(metadata["key_min_numel"])
++        ).reshape(cols).float()
++        key_scale = _read_fp16(
++            raw, int(metadata["key_scale_offset"]), int(metadata["key_scale_numel"])
++        ).reshape(cols).float()
++        value_min = _read_fp16(
++            raw, int(metadata["value_min_offset"]), int(metadata["value_min_numel"])
++        ).reshape(tokens).float()
++        value_scale = _read_fp16(
++            raw, int(metadata["value_scale_offset"]), int(metadata["value_scale_numel"])
++        ).reshape(tokens).float()
++
++        key = key_q.float() * key_scale[None, :] + key_min[None, :]
++        value = value_q.float() * value_scale[:, None] + value_min[:, None]
++        canonical = torch.stack(
++            [
++                key.reshape(tokens, heads, head_dim),
++                value.reshape(tokens, heads, head_dim),
++            ],
++            dim=0,
++        ).to(dtype=_dtype_from_metadata(metadata))
++        tensor = KiviAdapter._restore_layout(canonical, metadata)
++        if dst_cache is not None and block_ids is not None:
++            block_ids_tensor = torch.tensor(
++                list(block_ids), dtype=torch.long, device=dst_cache.device
++            )
++            dst_cache[block_ids_tensor] = tensor.to(
++                dtype=dst_cache.dtype, device=dst_cache.device
++            )
++            if dst_cache.device.type == "cuda":
++                event = torch.cuda.Event()
++                event.record(torch.cuda.current_stream())
++                return event
++        return tensor
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/mock_int4.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/mock_int4.py
 new file mode 100644
 index 0000000..f584ac7
@@ -11868,27 +13468,553 @@ index 0000000..5dafbb7
 +    return _REGISTRY[normalized](config)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/turboquant_adapter.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/turboquant_adapter.py
 new file mode 100644
-index 0000000..344231f
+index 0000000..714fd00
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/quantization/turboquant_adapter.py
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,537 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
 +
-+from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.raw_tensor import (
-+    TorchSerializedTensorAdapter,
++import math
++import importlib.util
++import json
++import sys
++import types
++from pathlib import Path
++from typing import Any
++
++import torch
++
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.base import (
++    QuantizedKV,
++    QuantizerAdapter,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.quantization.kivi_adapter import (
++    KiviAdapter,
++    _pack_ordered_lowbit,
++    _unpack_ordered_lowbit,
 +)
 +
++TURBO_DATA_ORDER = ("layer", "head", "head_dim", "token")
 +
-+class TurboQuantAdapter(TorchSerializedTensorAdapter):
++
++def _ensure_dserve_path() -> None:
++    for candidate in (Path("/home/td/dpucomp"), Path(__file__).resolve().parents[8]):
++        if candidate.exists() and str(candidate) not in sys.path:
++            sys.path.insert(0, str(candidate))
++
++
++def _load_dserve_helpers() -> dict[str, Any]:
++    _ensure_dserve_path()
++    try:
++        from dserve_kv_compress.origami_adapters import (  # type: ignore
++            _bytes_to_tensor,
++            _load_turbo_modules,
++            _pack_last_dim_lowbit,
++            _tensor_bytes,
++        )
++    except Exception as exc:  # pragma: no cover - dependency is optional.
++        raise RuntimeError(
++            "TurboQuantAdapter requires /home/td/dpucomp/dserve_kv_compress"
++        ) from exc
++    try:
++        modules = _load_turbo_modules()
++    except Exception:
++        modules = _load_turbo_modules_without_scipy()
++    modules.update(
++        {
++            "_bytes_to_tensor": _bytes_to_tensor,
++            "_pack_last_dim_lowbit": _pack_last_dim_lowbit,
++            "_tensor_bytes": _tensor_bytes,
++        }
++    )
++    return modules
++
++
++def _load_module_from_path(name: str, path: Path):
++    module = sys.modules.get(name)
++    if module is not None:
++        return module
++    spec = importlib.util.spec_from_file_location(name, path)
++    if spec is None or spec.loader is None:
++        raise ImportError(f"cannot load {name} from {path}")
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def _load_turbo_modules_without_scipy() -> dict[str, Any]:
++    """Load TurboQuant modules using precomputed JSON codebooks only."""
++    root = Path("/home/td/dpucomp/turboquant/turboquant")
++    if not root.exists():
++        root = Path("/home/td/Origami/third_party/turboquant/turboquant")
++    if not root.exists():
++        raise RuntimeError("TurboQuant source tree not found")
++
++    package = sys.modules.get("turboquant")
++    if package is None:
++        package = types.ModuleType("turboquant")
++        package.__path__ = [str(root)]  # type: ignore[attr-defined]
++        sys.modules["turboquant"] = package
++
++    codebook_name = "turboquant.codebook"
++    if codebook_name not in sys.modules:
++        codebook = types.ModuleType(codebook_name)
++
++        def get_codebook_tensors(
++            d: int,
++            bits: int,
++            device: torch.device,
++            dtype: torch.dtype = torch.float32,
++        ):
++            path = root / "codebooks" / f"codebook_d{int(d)}_b{int(bits)}.json"
++            if not path.exists():
++                raise RuntimeError(
++                    f"missing precomputed TurboQuant codebook {path}; "
++                    "install scipy to compute it on demand"
++                )
++            with path.open("r", encoding="utf-8") as handle:
++                payload = json.load(handle)
++            centroids = torch.tensor(payload["centroids"], device=device, dtype=dtype)
++            boundaries = torch.tensor(payload["boundaries"], device=device, dtype=dtype)
++            return centroids, boundaries
++
++        codebook.get_codebook_tensors = get_codebook_tensors
++        sys.modules[codebook_name] = codebook
++
++    _load_module_from_path("turboquant.rotation", root / "rotation.py")
++    quantizer = _load_module_from_path("turboquant.quantizer", root / "quantizer.py")
++    kv_cache = _load_module_from_path("turboquant.kv_cache", root / "kv_cache.py")
++    return {
++        "TurboQuantKVCache": kv_cache.TurboQuantKVCache,
++        "ValueQuantized": kv_cache.ValueQuantized,
++        "dequantize_values": kv_cache.dequantize_values,
++        "unpack_values": kv_cache.unpack_values,
++        "ProdQuantized": quantizer.ProdQuantized,
++        "TurboQuantProd": quantizer.TurboQuantProd,
++        "_pack_indices": quantizer._pack_indices,
++        "_unpack_indices": quantizer._unpack_indices,
++    }
++
++
++def _dtype_from_metadata(metadata: dict[str, Any]) -> torch.dtype:
++    dtype_name = str(metadata.get("dtype", "float16")).replace("torch.", "")
++    dtype = getattr(torch, dtype_name, None)
++    if not isinstance(dtype, torch.dtype):
++        raise ValueError(f"Unsupported TurboQuant tensor dtype {dtype_name!r}")
++    return dtype
++
++
++def _fp16_bytes(tensor: torch.Tensor) -> torch.Tensor:
++    return (
++        tensor.detach()
++        .cpu()
++        .to(torch.float16)
++        .contiguous()
++        .view(torch.uint8)
++        .reshape(-1)
++    )
++
++
++def _raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
++    return tensor.detach().cpu().to(torch.uint8).contiguous().reshape(-1)
++
++
++def _bytes_to_u8(data: bytes) -> torch.Tensor:
++    return torch.frombuffer(bytearray(data), dtype=torch.uint8).clone()
++
++
++def _read_fp16(raw: torch.Tensor, offset: int, shape: tuple[int, ...]) -> torch.Tensor:
++    if not shape:
++        return torch.empty((0,), dtype=torch.float16)
++    count = int(math.prod(shape))
++    return (
++        raw.narrow(0, int(offset), count * 2)
++        .contiguous()
++        .view(torch.float16)
++        .reshape(shape)
++    )
++
++
++class TurboQuantAdapter(QuantizerAdapter):
++    """TurboQuant K3V2 adapter without a lossless compression stage."""
++
 +    quantizer_id = "turboquant"
++
++    def __init__(self, config: dict[str, Any] | None = None):
++        super().__init__(config)
++        self.key_bits = int(self.config.get("key_bits", self.config.get("turbo_key_bits", 3)))
++        self.value_bits = int(
++            self.config.get("value_bits", self.config.get("turbo_value_bits", 2))
++        )
++        self.value_group_size = int(
++            self.config.get(
++                "value_group_size", self.config.get("turbo_value_group_size", 32)
++            )
++        )
++        self.buffer_size = int(
++            self.config.get("buffer_size", self.config.get("turbo_buffer_size", 128))
++        )
++        self.device = str(self.config.get("device", self.config.get("turbo_device", "cuda:0")))
++        if self.key_bits < 2:
++            raise ValueError("TurboQuantAdapter key_bits must be >= 2")
++        if self.value_bits not in {2, 4, 8}:
++            raise ValueError("TurboQuantAdapter value_bits must be one of {2, 4, 8}")
++
++    @staticmethod
++    def _layer_index(layer_group: Any | None) -> int:
++        if layer_group is None:
++            return 0
++        digits = ""
++        for ch in reversed(str(layer_group)):
++            if ch.isdigit():
++                digits = ch + digits
++            elif digits:
++                break
++        return int(digits) if digits else 0
++
++    def quantize(
++        self,
++        kv: torch.Tensor,
++        *,
++        request: Any | None = None,
++        layer_group: Any | None = None,
++        stream: Any | None = None,
++    ) -> QuantizedKV:
++        del request, stream
++        modules = _load_dserve_helpers()
++        TurboQuantKVCache = modules["TurboQuantKVCache"]
++        unpack_values = modules["unpack_values"]
++        unpack_indices = modules["_unpack_indices"]
++        tensor_bytes = modules["_tensor_bytes"]
++
++        canonical, layout = KiviAdapter._canonicalize(kv)
++        canonical_cpu = canonical.detach().cpu().to(torch.float16).contiguous()
++        tokens = int(canonical_cpu.shape[1])
++        heads = int(canonical_cpu.shape[2])
++        head_dim = int(canonical_cpu.shape[3])
++        layer_idx = self._layer_index(layer_group)
++        device = torch.device(self.device)
++        if device.type == "cuda" and not torch.cuda.is_available():
++            raise RuntimeError("TurboQuantAdapter CUDA device requested but CUDA is unavailable")
++
++        key = canonical_cpu[0].permute(1, 0, 2).unsqueeze(0).to(device=device)
++        value = canonical_cpu[1].permute(1, 0, 2).unsqueeze(0).to(device=device)
++        tq_cache = TurboQuantKVCache(
++            head_dim=head_dim,
++            key_bits=self.key_bits,
++            value_bits=self.value_bits,
++            value_group_size=self.value_group_size,
++            buffer_size=self.buffer_size,
++            device=device,
++            dtype=torch.float16,
++            layer_idx=layer_idx,
++        )
++        tq_cache.prefill(key.contiguous(), value.contiguous())
++        quant_tokens = max(0, tokens - self.buffer_size)
++        key_mse_bits = max(1, self.key_bits - 1)
++
++        parts: list[torch.Tensor] = []
++        offsets: dict[str, int] = {}
++        cursor = 0
++
++        def append(name: str, data: torch.Tensor, *, align: int = 1) -> None:
++            nonlocal cursor
++            if align > 1:
++                pad = (-cursor) % align
++                if pad:
++                    parts.append(torch.zeros((pad,), dtype=torch.uint8))
++                    cursor += pad
++            offsets[name] = cursor
++            flat = data.detach().cpu().to(torch.uint8).reshape(-1).contiguous()
++            parts.append(flat)
++            cursor += int(flat.numel())
++
++        qjl_shape: tuple[int, ...] = ()
++        key_norms_shape: tuple[int, ...] = ()
++        key_residual_norms_shape: tuple[int, ...] = ()
++        if tq_cache.key_quantized is not None:
++            key_q = tq_cache.key_quantized
++            key_mse_bits = int(key_q.mse_bits)
++            mse = unpack_indices(key_q.mse_indices, key_q.mse_bits, head_dim).to(torch.uint8)
++            mse_layer = mse.squeeze(0).permute(1, 0, 2).cpu().contiguous()
++            key_mse_data = _pack_ordered_lowbit(
++                mse_layer.unsqueeze(0), TURBO_DATA_ORDER, key_mse_bits
++            )
++            qjl_cpu = key_q.qjl_signs.detach().cpu().to(torch.uint8).contiguous()
++            qjl_shape = tuple(int(v) for v in qjl_cpu.shape)
++            key_norms = key_q.norms.detach().cpu().to(torch.float16).contiguous()
++            key_residual_norms = (
++                key_q.residual_norms.detach().cpu().to(torch.float16).contiguous()
++            )
++            key_norms_shape = tuple(int(v) for v in key_norms.shape)
++            key_residual_norms_shape = tuple(int(v) for v in key_residual_norms.shape)
++        else:
++            key_mse_data = torch.empty((0,), dtype=torch.uint8)
++            qjl_cpu = torch.empty((0,), dtype=torch.uint8)
++            key_norms = torch.empty((0,), dtype=torch.float16)
++            key_residual_norms = torch.empty((0,), dtype=torch.float16)
++
++        value_scales_shape: tuple[int, ...] = ()
++        value_zeros_shape: tuple[int, ...] = ()
++        if tq_cache.value_quantized is not None:
++            value_q = tq_cache.value_quantized
++            codes = unpack_values(value_q).to(torch.uint8)
++            value_layer = codes.squeeze(0).permute(1, 0, 2).cpu().contiguous()
++            value_data = _pack_ordered_lowbit(
++                value_layer.unsqueeze(0), TURBO_DATA_ORDER, self.value_bits
++            )
++            value_scales = value_q.scales.detach().cpu().to(torch.float16).contiguous()
++            value_zeros = value_q.zeros.detach().cpu().to(torch.float16).contiguous()
++            value_scales_shape = tuple(int(v) for v in value_scales.shape)
++            value_zeros_shape = tuple(int(v) for v in value_zeros.shape)
++        else:
++            value_data = torch.empty((0,), dtype=torch.uint8)
++            value_scales = torch.empty((0,), dtype=torch.float16)
++            value_zeros = torch.empty((0,), dtype=torch.float16)
++
++        if tq_cache.key_buffer is not None:
++            key_recent = tq_cache.key_buffer.detach().cpu().to(torch.float16).contiguous()
++            value_recent = tq_cache.value_buffer.detach().cpu().to(torch.float16).contiguous()
++        else:
++            key_recent = torch.empty((1, heads, 0, head_dim), dtype=torch.float16)
++            value_recent = torch.empty((1, heads, 0, head_dim), dtype=torch.float16)
++        key_recent_shape = tuple(int(v) for v in key_recent.shape)
++        value_recent_shape = tuple(int(v) for v in value_recent.shape)
++
++        append("key_mse_stream", key_mse_data)
++        append("key_qjl", qjl_cpu)
++        append("value_stream", value_data)
++        append("key_norms", _fp16_bytes(key_norms), align=2)
++        append("key_residual_norms", _fp16_bytes(key_residual_norms), align=2)
++        append("value_scales", _fp16_bytes(value_scales), align=2)
++        append("value_zeros", _fp16_bytes(value_zeros), align=2)
++        append("key_recent", _bytes_to_u8(tensor_bytes(key_recent)), align=2)
++        append("value_recent", _bytes_to_u8(tensor_bytes(value_recent)), align=2)
++        symbols = torch.cat(parts, dim=0).contiguous()
++
++        metadata: dict[str, Any] = {
++            "format": "turboquant_structured_blob",
++            "version": 1,
++            "dtype": str(kv.dtype).replace("torch.", ""),
++            "shape": [int(dim) for dim in kv.shape],
++            "kv_layout": layout,
++            "layer_idx": layer_idx,
++            "token_count": tokens,
++            "num_heads": heads,
++            "head_dim": head_dim,
++            "quant_tokens": quant_tokens,
++            "key_bits": self.key_bits,
++            "key_mse_bits": key_mse_bits,
++            "value_bits": self.value_bits,
++            "value_group_size": self.value_group_size,
++            "buffer_size": self.buffer_size,
++            "device": str(device),
++            "key_mse_shape": [1, quant_tokens, heads, head_dim],
++            "value_shape": [1, quant_tokens, heads, head_dim],
++            "data_order": list(TURBO_DATA_ORDER),
++            "qjl_shape": list(qjl_shape),
++            "key_norms_shape": list(key_norms_shape),
++            "key_residual_norms_shape": list(key_residual_norms_shape),
++            "value_scales_shape": list(value_scales_shape),
++            "value_zeros_shape": list(value_zeros_shape),
++            "key_recent_shape": list(key_recent_shape),
++            "value_recent_shape": list(value_recent_shape),
++            "symbol_byte_count": int(symbols.numel()),
++            "origami_bits": 8,
++            "origami_symbol_shape": [1, 1, int(symbols.numel())],
++            "origami_symbol_layout": ["token", "head", "head_dim"],
++        }
++        for name, offset in offsets.items():
++            metadata[f"{name}_offset"] = int(offset)
++        for name in offsets:
++            next_offsets = [value for key, value in offsets.items() if value > offsets[name]]
++            end = min(next_offsets) if next_offsets else int(symbols.numel())
++            metadata[f"{name}_bytes"] = int(end - offsets[name])
++        del tq_cache, key, value
++        if device.type == "cuda":
++            torch.cuda.empty_cache()
++        return QuantizedKV(symbols=symbols, metadata=metadata)
++
++    def dequantize(
++        self,
++        symbols: torch.Tensor,
++        metadata: dict[str, Any],
++        *,
++        dst_cache: torch.Tensor | None = None,
++        block_ids: list[int] | tuple[int, ...] | None = None,
++        stream: Any | None = None,
++    ) -> torch.Tensor | Any:
++        del stream
++        if str(metadata.get("format")) != "turboquant_structured_blob":
++            raise ValueError("TurboQuantAdapter can only dequantize TurboQuant payloads")
++        modules = _load_dserve_helpers()
++        ValueQuantized = modules["ValueQuantized"]
++        dequantize_values = modules["dequantize_values"]
++        ProdQuantized = modules["ProdQuantized"]
++        TurboQuantProd = modules["TurboQuantProd"]
++        pack_indices = modules["_pack_indices"]
++        bytes_to_tensor = modules["_bytes_to_tensor"]
++        pack_last_dim_lowbit = modules["_pack_last_dim_lowbit"]
++
++        raw = symbols.detach().cpu().to(torch.uint8).reshape(-1).contiguous()
++        expected = int(metadata["symbol_byte_count"])
++        if int(raw.numel()) != expected:
++            raise RuntimeError(
++                f"TurboQuant payload size mismatch: got {int(raw.numel())}, expected {expected}"
++            )
++
++        tokens = int(metadata["token_count"])
++        heads = int(metadata["num_heads"])
++        head_dim = int(metadata["head_dim"])
++        quant_tokens = int(metadata["quant_tokens"])
++        device = torch.device(str(metadata.get("device", self.device)))
++        if device.type == "cuda" and not torch.cuda.is_available():
++            device = torch.device("cpu")
++
++        key_shape = tuple(int(v) for v in metadata["key_mse_shape"])
++        value_shape = tuple(int(v) for v in metadata["value_shape"])
++        order = tuple(metadata["data_order"])
++        key_mse_data = raw.narrow(
++            0, int(metadata["key_mse_stream_offset"]), int(metadata["key_mse_stream_bytes"])
++        )
++        value_data = raw.narrow(
++            0, int(metadata["value_stream_offset"]), int(metadata["value_stream_bytes"])
++        )
++        key_mse_tensor = (
++            _unpack_ordered_lowbit(
++                key_mse_data,
++                shape=key_shape,
++                order=order,
++                bits=int(metadata["key_mse_bits"]),
++            )
++            if math.prod(key_shape)
++            else torch.empty(key_shape, dtype=torch.uint8)
++        )
++        value_tensor = (
++            _unpack_ordered_lowbit(
++                value_data,
++                shape=value_shape,
++                order=order,
++                bits=int(metadata["value_bits"]),
++            )
++            if math.prod(value_shape)
++            else torch.empty(value_shape, dtype=torch.uint8)
++        )
++
++        qjl_bytes = bytes(
++            raw.narrow(0, int(metadata["key_qjl_offset"]), int(metadata["key_qjl_bytes"]))
++            .tolist()
++        )
++        key_norms = _read_fp16(
++            raw, int(metadata["key_norms_offset"]), tuple(metadata["key_norms_shape"])
++        )
++        key_residual_norms = _read_fp16(
++            raw,
++            int(metadata["key_residual_norms_offset"]),
++            tuple(metadata["key_residual_norms_shape"]),
++        )
++        value_scales = _read_fp16(
++            raw, int(metadata["value_scales_offset"]), tuple(metadata["value_scales_shape"])
++        )
++        value_zeros = _read_fp16(
++            raw, int(metadata["value_zeros_offset"]), tuple(metadata["value_zeros_shape"])
++        )
++        key_recent_bytes = bytes(
++            raw.narrow(
++                0, int(metadata["key_recent_offset"]), int(metadata["key_recent_bytes"])
++            ).tolist()
++        )
++        value_recent_bytes = bytes(
++            raw.narrow(
++                0,
++                int(metadata["value_recent_offset"]),
++                int(metadata["value_recent_bytes"]),
++            ).tolist()
++        )
++        key_recent = bytes_to_tensor(
++            key_recent_bytes,
++            dtype=torch.float16,
++            shape=tuple(metadata["key_recent_shape"]),
++        )
++        value_recent = bytes_to_tensor(
++            value_recent_bytes,
++            dtype=torch.float16,
++            shape=tuple(metadata["value_recent_shape"]),
++        )
++
++        if quant_tokens > 0:
++            mse_symbols = key_mse_tensor[0].permute(1, 0, 2).unsqueeze(0).to(device=device)
++            mse_indices = pack_indices(mse_symbols, int(metadata["key_mse_bits"]))
++            qjl = bytes_to_tensor(
++                qjl_bytes,
++                dtype=torch.uint8,
++                shape=tuple(metadata["qjl_shape"]),
++            ).to(device=device)
++            key_quantizer = TurboQuantProd(
++                dim=head_dim,
++                bits=int(metadata["key_bits"]),
++                device=device,
++                seed=42 + int(metadata["layer_idx"]) * 7,
++            )
++            prod = ProdQuantized(
++                mse_indices=mse_indices,
++                qjl_signs=qjl,
++                residual_norms=key_residual_norms.to(device=device),
++                norms=key_norms.to(device=device),
++                mse_bits=int(metadata["key_mse_bits"]),
++            )
++            key_quant = key_quantizer.dequantize(prod).to(torch.float16).cpu()
++            value_codes = value_tensor[0].permute(1, 0, 2).unsqueeze(0)
++            value_packed = pack_last_dim_lowbit(
++                value_codes.cpu(), int(metadata["value_bits"])
++            ).to(device=device)
++            value_quant = ValueQuantized(
++                data=value_packed,
++                scales=value_scales.to(device=device),
++                zeros=value_zeros.to(device=device),
++                bits=int(metadata["value_bits"]),
++            )
++            value_quant_decoded = dequantize_values(
++                value_quant,
++                group_size=int(metadata["value_group_size"]),
++            ).to(torch.float16).cpu()
++        else:
++            key_quant = torch.empty((1, heads, 0, head_dim), dtype=torch.float16)
++            value_quant_decoded = torch.empty((1, heads, 0, head_dim), dtype=torch.float16)
++
++        key = torch.cat([key_quant, key_recent.cpu()], dim=-2).contiguous()
++        value = torch.cat([value_quant_decoded, value_recent.cpu()], dim=-2).contiguous()
++        if int(key.shape[-2]) != tokens or int(value.shape[-2]) != tokens:
++            raise RuntimeError("TurboQuant dequantized token count mismatch")
++        canonical = torch.stack(
++            [
++                key.squeeze(0).permute(1, 0, 2),
++                value.squeeze(0).permute(1, 0, 2),
++            ],
++            dim=0,
++        ).to(dtype=_dtype_from_metadata(metadata))
++        tensor = KiviAdapter._restore_layout(canonical, metadata)
++        if dst_cache is not None and block_ids is not None:
++            block_ids_tensor = torch.tensor(
++                list(block_ids), dtype=torch.long, device=dst_cache.device
++            )
++            dst_cache[block_ids_tensor] = tensor.to(
++                dtype=dst_cache.dtype, device=dst_cache.device
++            )
++            if dst_cache.device.type == "cuda":
++                event = torch.cuda.Event()
++                event.record(torch.cuda.current_stream())
++                return event
++        return tensor
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/scheduler.py
 new file mode 100644
-index 0000000..a406f69
+index 0000000..17d4971
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/scheduler.py
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,341 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -11899,6 +14025,7 @@ index 0000000..a406f69
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import (
 +    OrigamiConfig,
 +    _parse_ratio,
++    fused_attention_compatibility,
 +)
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.pipeline import (
 +    select_gpu_lossless_requests,
@@ -12014,7 +14141,11 @@ index 0000000..a406f69
 +        self.config = config
 +        self.block_size = vllm_config.cache_config.block_size
 +        self.controller = OrigamiOffloadController(config)
++        self.fused_enabled, self.fused_disabled_reason = (
++            fused_attention_compatibility(vllm_config, config)
++        )
 +        self._restored_requests: set[str] = set()
++        self._restored_prefix_tokens: dict[str, int] = {}
 +        self._pending_restores: dict[str, OrigamiRestoreRequest] = {}
 +        self._save_candidates: dict[str, _SavePlan] = {}
 +        self._last_observed_pcie_gbps = 0.0
@@ -12081,11 +14212,18 @@ index 0000000..a406f69
 +            metric_request_id=_metric_request_id(request),
 +        )
 +        self._restored_requests.add(req_id)
++        self._restored_prefix_tokens[req_id] = int(num_external_tokens)
 +
 +    def build_connector_meta(
 +        self,
 +        scheduler_output: "SchedulerOutput",
 +    ) -> OrigamiConnectorMetadata:
++        # Preemption frees the paged blocks but not the worker's compressed
++        # payload. Permit the request to match the external prefix again so
++        # the allocator reserves replacement logical blocks.
++        self._restored_requests.difference_update(
++            scheduler_output.preempted_req_ids or set()
++        )
 +        ratio = self.controller.observe_schedule_step(self._last_observed_pcie_gbps)
 +        request_ids = sorted(self._pending_restores)
 +        gpu_request_ids = select_gpu_lossless_requests(request_ids, ratio)
@@ -12102,11 +14240,59 @@ index 0000000..a406f69
 +            )
 +
 +        saves = self._build_save_metadata(scheduler_output)
++        fused_request_ids: tuple[str, ...] = ()
++        fused_query_start_positions: dict[str, int] = {}
++        fused_query_token_counts: dict[str, int] = {}
++        fused_request_indices: dict[str, int] = {}
++        fused_codecs: dict[str, str] = {}
++        fused_prefix_lengths: dict[str, int] = {}
++        if self.fused_enabled:
++            fused_request_ids = tuple(
++                req_id
++                for req_id in scheduler_output.num_scheduled_tokens
++                if req_id in self._restored_requests
++            )
++            fused_set = set(fused_request_ids)
++            for request in scheduler_output.scheduled_new_reqs:
++                if request.req_id in fused_set:
++                    fused_query_start_positions[request.req_id] = int(
++                        request.num_computed_tokens
++                    )
++            cached = scheduler_output.scheduled_cached_reqs
++            for req_id, num_computed_tokens in zip(
++                cached.req_ids, cached.num_computed_tokens
++            ):
++                if req_id in fused_set:
++                    fused_query_start_positions[req_id] = int(num_computed_tokens)
++            fused_query_token_counts = {
++                req_id: int(scheduler_output.num_scheduled_tokens[req_id])
++                for req_id in fused_request_ids
++            }
++            fused_request_indices = {
++                req_id: index
++                for index, req_id in enumerate(
++                    scheduler_output.num_scheduled_tokens
++                )
++                if req_id in fused_set
++            }
++            fused_codecs = {
++                req_id: self.config.quantizer for req_id in fused_request_ids
++            }
++            fused_prefix_lengths = {
++                req_id: int(self._restored_prefix_tokens[req_id])
++                for req_id in fused_request_ids
++            }
 +        self._pending_restores.clear()
 +        return OrigamiConnectorMetadata(
 +            reqs_to_restore=restores,
 +            reqs_to_save=saves,
 +            gpu_lossless_ratio=ratio,
++            fused_request_ids=fused_request_ids,
++            fused_query_start_positions=fused_query_start_positions,
++            fused_query_token_counts=fused_query_token_counts,
++            fused_request_indices=fused_request_indices,
++            fused_codecs=fused_codecs,
++            fused_prefix_lengths=fused_prefix_lengths,
 +        )
 +
 +    def _build_save_metadata(
@@ -12168,13 +14354,14 @@ index 0000000..a406f69
 +    def request_finished(self, request: "Request") -> None:
 +        req_id = request.request_id
 +        self._restored_requests.discard(req_id)
++        self._restored_prefix_tokens.pop(req_id, None)
 +        self._save_candidates.pop(req_id, None)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/store.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/store.py
 new file mode 100644
-index 0000000..008b216
+index 0000000..0dfc798
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/store.py
-@@ -0,0 +1,926 @@
+@@ -0,0 +1,937 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -12222,6 +14409,14 @@ index 0000000..008b216
 +def _codec_uses_qat_bundle(codec: str) -> bool:
 +    normalized = str(codec).lower()
 +    return normalized not in {"raw", "identity"} and not normalized.startswith("nvcomp")
++
++
++def _uses_native_qat_bundle_format(path: Path) -> bool:
++    try:
++        with path.open("rb") as handle:
++            return handle.read(8) == b"ORIGQZ1\0"
++    except OSError:
++        return False
 +
 +
 +@dataclass(frozen=True)
@@ -12449,7 +14644,7 @@ index 0000000..008b216
 +        if (
 +            lossless_backend == "qat"
 +            and native_cpu.qat_codec() == "qat_codec"
-+            and self._qat_bundle_path(cache_key).exists()
++            and _uses_native_qat_bundle_format(self._qat_bundle_path(cache_key))
 +        ):
 +            bundle_path = self._qat_bundle_path(cache_key)
 +            payload = self._payload_from_manifest(manifest, compressed_data=None)
@@ -12625,6 +14820,9 @@ index 0000000..008b216
 +            return self._payload_from_manifest(manifest, data)
 +
 +        payload_path = self._payload_path(cache_key)
++        ingress_mode = str(artifact_ingress_mode).lower().replace("_", "-")
++        if ingress_mode == "native-file":
++            ingress_mode = "file"
 +        data = controlled_read(
 +            payload_path,
 +            request_id=request_id,
@@ -12632,7 +14830,7 @@ index 0000000..008b216
 +            system=system,
 +            bandwidth_gbps=read_bandwidth_gbps,
 +            metrics_path=metrics_path,
-+            ingress_mode=artifact_ingress_mode,
++            ingress_mode=ingress_mode,
 +        )
 +        bytestream = torch.frombuffer(bytearray(data), dtype=torch.uint8)
 +        payload = self._payload_from_manifest(manifest, compressed_data=None)
@@ -13103,10 +15301,10 @@ index 0000000..008b216
 +    return LocalFileOrigamiStore(uri, artifact_format=artifact_format)
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/origami/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/origami/worker.py
 new file mode 100644
-index 0000000..627488e
+index 0000000..9c17bbc
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/origami/worker.py
-@@ -0,0 +1,2253 @@
+@@ -0,0 +1,2499 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +from __future__ import annotations
@@ -13128,6 +15326,9 @@ index 0000000..627488e
 +    write_jsonl,
 +)
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import OrigamiConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.origami.fused_attention import (
++    FusedLayerPayload,
++)
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import native_cpu
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless import native_gpu
 +from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.chunking import (
@@ -13194,6 +15395,7 @@ index 0000000..627488e
 +    event: torch.cuda.Event | None = None
 +    pending_metrics: list[tuple[str, OrigamiRestoreRequest, LayerPayload,
 +                                dict[str, Any]]] | None = None
++    wait_on_current_stream: bool = True
 +
 +
 +def _ms_since(start: float) -> float:
@@ -13303,10 +15505,13 @@ index 0000000..627488e
 +        config: OrigamiConfig,
 +        store: OrigamiStore,
 +        kv_cache_config: Any | None = None,
++        *,
++        fused_attention_enabled: bool = False,
 +    ):
 +        self.config = config
 +        self.store = store
 +        self.kv_cache_config = kv_cache_config
++        self.fused_attention_enabled = bool(fused_attention_enabled)
 +        self.quantizer: QuantizerAdapter = create_quantizer_adapter(
 +            config.quantizer, config.quantizer_config
 +        )
@@ -13331,6 +15536,17 @@ index 0000000..627488e
 +        self._save_futures: list[Future[tuple[OrigamiSaveRequest, LayerPayload]]] = []
 +        self._save_payloads: dict[str, OrigamiPayload] = {}
 +        self._save_lock = Lock()
++        self._fused_lock = Lock()
++        self._fused_payloads: dict[
++            tuple[str, str, str], FusedLayerPayload
++        ] = {}
++        self._request_fused_keys: dict[
++            str, dict[str, tuple[str, str, str]]
++        ] = {}
++        self._fused_upload_stream: torch.cuda.Stream | None = None
++        self._fused_attention_stream: torch.cuda.Stream | None = None
++        self._fused_qkv_ready_event: torch.cuda.Event | None = None
++        self._fused_done_event: torch.cuda.Event | None = None
 +        self._metadata: OrigamiConnectorMetadata | None = None
 +        self.metrics_path = (
 +            str(Path(config.metrics_dir) / "origami_metrics.jsonl")
@@ -13350,6 +15566,154 @@ index 0000000..627488e
 +                    or config.dequant_device in {"gpu", "cuda"}
 +                ):
 +                    raise
++        if self.fused_attention_enabled:
++            capability = torch.cuda.get_device_capability()
++            if capability < (8, 0):
++                if config.fused_attention == "required":
++                    raise RuntimeError(
++                        "Origami fused attention requires CUDA compute capability 8.0+"
++                    )
++                self.fused_attention_enabled = False
++            else:
++                try:
++                    native_gpu.load_bitpack_cuda_extension()
++                except Exception:
++                    if config.fused_attention == "required":
++                        raise
++                    self.fused_attention_enabled = False
++            if self.fused_attention_enabled:
++                self._fused_upload_stream = torch.cuda.Stream(priority=0)
++                self._fused_attention_stream = torch.cuda.Stream(
++                    priority=config.fused_stream_priority
++                )
++                self._fused_qkv_ready_event = torch.cuda.Event()
++                self._fused_done_event = torch.cuda.Event()
++
++    def _store_fused_layer_payload(
++        self,
++        restore: OrigamiRestoreRequest,
++        layer_payload: LayerPayload,
++        symbols: torch.Tensor,
++    ) -> _LayerLoadResult | None:
++        metadata = layer_payload.quant_metadata
++        fmt = str(metadata.get("format", ""))
++        expected_format = {
++            "kivi": "kivi_structured_blob",
++            "kvquant": "kvquant_structured_blob",
++        }.get(self.quantizer.quantizer_id)
++        artifact_compatible = (
++            expected_format is not None
++            and fmt == expected_format
++            and int(metadata.get("token_count", 0)) == int(restore.num_tokens)
++        )
++        if not self.fused_attention_enabled or self._fused_upload_stream is None:
++            return None
++        if not artifact_compatible:
++            if self.config.fused_attention == "required":
++                raise RuntimeError(
++                    "Origami fused attention requires a full structured "
++                    f"{self.quantizer.quantizer_id} prefix artifact"
++                )
++            return None
++
++        key = (restore.cache_key, layer_payload.layer_name, self.quantizer.quantizer_id)
++        with self._fused_lock:
++            existing = self._fused_payloads.get(key)
++            if existing is not None:
++                request_keys = self._request_fused_keys.setdefault(
++                    restore.request_id, {}
++                )
++                if request_keys.get(layer_payload.layer_name) != key:
++                    existing.ref_count += 1
++                    request_keys[layer_payload.layer_name] = key
++                return _LayerLoadResult(
++                    event=existing.ready_event,
++                    wait_on_current_stream=False,
++                )
++
++        kv_cache = self.kv_caches[layer_payload.layer_name]
++        producer_event = None
++        if symbols.is_cuda:
++            producer_event = torch.cuda.Event()
++            producer_event.record(torch.cuda.current_stream(symbols.device))
++        with torch.cuda.stream(self._fused_upload_stream):
++            if producer_event is not None:
++                self._fused_upload_stream.wait_event(producer_event)
++            raw = symbols.detach().reshape(-1)
++            raw_gpu = raw.to(
++                device=kv_cache.device,
++                dtype=torch.uint8,
++                non_blocking=True,
++            ).contiguous()
++            ready_event = torch.cuda.Event()
++            ready_event.record(self._fused_upload_stream)
++        payload = FusedLayerPayload(
++            request_id=restore.request_id,
++            cache_key=restore.cache_key,
++            layer_name=layer_payload.layer_name,
++            quantizer=self.quantizer.quantizer_id,
++            symbols=raw_gpu,
++            metadata=dict(metadata),
++            ready_event=ready_event,
++        )
++        with self._fused_lock:
++            raced = self._fused_payloads.get(key)
++            if raced is None:
++                self._fused_payloads[key] = payload
++                selected = payload
++            else:
++                selected = raced
++            request_keys = self._request_fused_keys.setdefault(
++                restore.request_id, {}
++            )
++            if request_keys.get(layer_payload.layer_name) != key:
++                if raced is not None:
++                    raced.ref_count += 1
++                request_keys[layer_payload.layer_name] = key
++        return _LayerLoadResult(
++            event=selected.ready_event,
++            wait_on_current_stream=False,
++        )
++
++    def get_fused_layer_payloads(
++        self,
++        layer_name: str,
++        request_ids: tuple[str, ...] | list[str],
++    ) -> dict[str, FusedLayerPayload]:
++        result: dict[str, FusedLayerPayload] = {}
++        with self._fused_lock:
++            for request_id in request_ids:
++                key = self._request_fused_keys.get(request_id, {}).get(layer_name)
++                if key is not None and key in self._fused_payloads:
++                    result[request_id] = self._fused_payloads[key]
++        return result
++
++    def get_fused_attention_stream_state(self):
++        if not self.fused_attention_enabled:
++            return None
++        if (
++            self._fused_attention_stream is None
++            or self._fused_qkv_ready_event is None
++            or self._fused_done_event is None
++        ):
++            return None
++        return (
++            self._fused_attention_stream,
++            self._fused_qkv_ready_event,
++            self._fused_done_event,
++        )
++
++    def release_fused_requests(self, request_ids: set[str]) -> None:
++        with self._fused_lock:
++            for request_id in request_ids:
++                keys = self._request_fused_keys.pop(request_id, {})
++                for key in keys.values():
++                    payload = self._fused_payloads.get(key)
++                    if payload is None:
++                        continue
++                    payload.ref_count -= 1
++                    if payload.ref_count <= 0:
++                        self._fused_payloads.pop(key, None)
 +
 +    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
 +        self.kv_caches = dict(kv_caches)
@@ -13395,8 +15759,14 @@ index 0000000..627488e
 +            self._pending_request_layer_futures[restore.request_id] = list(
 +                layer_futures.values()
 +            )
++            retained = self._claim_cached_layer_events(restore)
++            restore_fn = (
++                self._restore_retained_request_layer_futures
++                if retained is not None
++                else self._restore_request_layer_futures
++            )
 +            restore_future = self._executor.submit(
-+                self._restore_request_layer_futures,
++                restore_fn,
 +                restore,
 +                layer_futures,
 +            )
@@ -13417,6 +15787,76 @@ index 0000000..627488e
 +            },
 +        )
 +
++    def _retained_layer_events(
++        self, request_id: str
++    ) -> dict[str, torch.cuda.Event] | None:
++        events: dict[str, torch.cuda.Event] = {}
++        with self._fused_lock:
++            request_keys = self._request_fused_keys.get(request_id, {})
++            for layer_name in self.kv_caches:
++                key = request_keys.get(layer_name)
++                payload = self._fused_payloads.get(key) if key is not None else None
++                if payload is None:
++                    return None
++                events[layer_name] = payload.ready_event
++        return events
++
++    def _claim_cached_layer_events(
++        self, restore: OrigamiRestoreRequest
++    ) -> dict[str, torch.cuda.Event] | None:
++        if not self.fused_attention_enabled:
++            return None
++        codec = self.quantizer.quantizer_id
++        with self._fused_lock:
++            cached: dict[
++                str, tuple[tuple[str, str, str], FusedLayerPayload]
++            ] = {}
++            for layer_name in self.kv_caches:
++                key = (restore.cache_key, layer_name, codec)
++                payload = self._fused_payloads.get(key)
++                if payload is None:
++                    return None
++                cached[layer_name] = (key, payload)
++
++            request_keys = self._request_fused_keys.setdefault(
++                restore.request_id, {}
++            )
++            for layer_name, (key, payload) in cached.items():
++                if request_keys.get(layer_name) != key:
++                    payload.ref_count += 1
++                    request_keys[layer_name] = key
++            return {
++                layer_name: payload.ready_event
++                for layer_name, (_, payload) in cached.items()
++            }
++
++    def _restore_retained_request_layer_futures(
++        self,
++        restore: OrigamiRestoreRequest,
++        layer_futures: dict[str, Future[Any]],
++    ) -> str:
++        events = self._retained_layer_events(restore.request_id)
++        if events is None:
++            raise RuntimeError(
++                f"retained Origami payload disappeared for {restore.request_id!r}"
++            )
++        for layer_name, future in layer_futures.items():
++            future.set_result(_LayerLoadResult(
++                event=events[layer_name],
++                wait_on_current_stream=False,
++            ))
++        write_jsonl(
++            self.metrics_path,
++            {
++                "type": "restore_retained_gpu_payload",
++                "system": "origami",
++                "request_id": _restore_metric_id(restore),
++                "cache_key": restore.cache_key,
++                "ts": time.time(),
++            },
++        )
++        return _restore_metric_id(restore)
++
 +    def wait_for_layer_load(self, layer_name: str) -> None:
 +        futures = self._pending_layer_futures.pop(layer_name, [])
 +        for future in futures:
@@ -13425,7 +15865,15 @@ index 0000000..627488e
 +                event = result.event
 +            else:
 +                event = result
-+            if event is not None and torch.cuda.is_available():
++            wait_on_current_stream = (
++                not isinstance(result, _LayerLoadResult)
++                or result.wait_on_current_stream
++            )
++            if (
++                event is not None
++                and wait_on_current_stream
++                and torch.cuda.is_available()
++            ):
 +                torch.cuda.current_stream().wait_event(event)
 +            if isinstance(result, _LayerLoadResult):
 +                self._flush_pending_cuda_metrics(result.pending_metrics)
@@ -13442,11 +15890,12 @@ index 0000000..627488e
 +            start_event = profile_fields.pop("_cuda_start_event", None)
 +            end_event = profile_fields.pop("_cuda_end_event", None)
 +            if start_event is not None and end_event is not None:
-+                # Profiling is finalized at the layer wait point so restore
-+                # scheduling can continue queuing later QAT windows/layers.
-+                end_event.synchronize()
-+                elapsed_ms = float(start_event.elapsed_time(end_event))
-+                profile_fields["ms"] = elapsed_ms
++                elapsed_ms = None
++                if end_event.query():
++                    elapsed_ms = float(start_event.elapsed_time(end_event))
++                    profile_fields["ms"] = elapsed_ms
++                else:
++                    profile_fields["cuda_timing_deferred"] = True
 +                input_bytes = int(profile_fields.get("input_bytes", 0) or 0)
 +                output_bytes = int(
 +                    profile_fields.get(
@@ -13454,7 +15903,7 @@ index 0000000..627488e
 +                    ) or 0
 +                )
 +                bytes_value = int(profile_fields.get("bytes", output_bytes) or 0)
-+                if elapsed_ms > 0:
++                if elapsed_ms is not None and elapsed_ms > 0:
 +                    if input_bytes:
 +                        profile_fields["input_gbps"] = (
 +                            input_bytes * 8.0 / elapsed_ms / 1e6
@@ -13995,6 +16444,14 @@ index 0000000..627488e
 +        if tokens_per_block > 0 and int(restore.num_tokens) > 0:
 +            needed_blocks = (int(restore.num_tokens) + tokens_per_block - 1) // tokens_per_block
 +            block_ids = block_ids[:needed_blocks]
++
++        fused_event = self._store_fused_layer_payload(
++            restore,
++            layer_payload,
++            symbols,
++        )
++        if fused_event is not None:
++            return fused_event
 +
 +        direct_event = self._try_restore_direct_to_cache(
 +            restore,
@@ -14688,10 +17145,8 @@ index 0000000..627488e
 +        restored_chunks = []
 +        total_compressed = 0
 +        total_unpacked = 0
-+        start_event = torch.cuda.Event(enable_timing=True)
-+        end_event = torch.cuda.Event(enable_timing=True)
++        enqueue_start = time.perf_counter()
 +        with nvtx_range("origami:kivi_nvcomp_decompress_cuda"):
-+            start_event.record()
 +            for chunk in layer_payload.chunks:
 +                compressed = chunk.compressed.to(
 +                    "cuda", dtype=torch.uint8, non_blocking=True
@@ -14704,15 +17159,13 @@ index 0000000..627488e
 +                        output_bytes=int(chunk.unpacked_bytes),
 +                    )
 +                )
-+            end_event.record()
 +        symbols = (
 +            restored_chunks[0].reshape(-1).contiguous()
 +            if len(restored_chunks) == 1
 +            else torch.cat([chunk.reshape(-1) for chunk in restored_chunks],
 +                           dim=0).contiguous()
 +        )
-+        end_event.synchronize()
-+        elapsed_ms = float(start_event.elapsed_time(end_event))
++        enqueue_ms = _ms_since(enqueue_start)
 +        self._write_restore_metric(
 +            "kivi_nvcomp_decompress_cuda",
 +            restore,
@@ -14726,17 +17179,8 @@ index 0000000..627488e
 +                "input_bytes": total_compressed,
 +                "output_bytes": total_unpacked,
 +                "bytes": total_unpacked,
-+                "ms": elapsed_ms,
-+                "compressed_gbps": (
-+                    total_compressed * 8.0 / elapsed_ms / 1e6
-+                    if elapsed_ms > 0.0
-+                    else 0.0
-+                ),
-+                "unpacked_gbps": (
-+                    total_unpacked * 8.0 / elapsed_ms / 1e6
-+                    if elapsed_ms > 0.0
-+                    else 0.0
-+                ),
++                "enqueue_ms": enqueue_ms,
++                "cuda_timing_deferred": True,
 +            },
 +        )
 +        return symbols
@@ -15361,13 +17805,168 @@ index 0000000..627488e
 +    def shutdown(self) -> None:
 +        self._executor.shutdown(wait=True)
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index ea2c2a6..073c4fc 100644
+index ea2c2a6..3a20101 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -1541,12 +1541,71 @@ class Scheduler(SchedulerInterface):
+@@ -359,6 +359,35 @@ class Scheduler(SchedulerInterface):
+             # Do not schedule any requests when paused.
+             token_budget = 0
+ 
++        origami_config = (
++            getattr(self.connector, "config", None)
++            if self.connector is not None
++            and type(self.connector).__name__ == "OrigamiConnector"
++            else None
++        )
++        origami_policy = getattr(origami_config, "batch_policy", None)
++        origami_fused_enabled = bool(
++            getattr(self.connector, "fused_attention_enabled", False)
++        )
++        origami_fused_budget = (
++            int(getattr(origami_config, "fused_max_requests", 8))
++            if origami_fused_enabled
++            else self.max_num_running_reqs
++        )
++        origami_fused_scheduled = 0
++        origami_resume_pending = False
++        if origami_policy in {"restored_priority_mixed", "restored_only"}:
++            origami_resume_pending = any(
++                self._is_origami_resume_request(request)
++                for request in (
++                    list(self.running) + list(self.waiting) + list(self.skipped_waiting)
++                )
++            )
++            # Stable partition: restored work consumes request/token budgets first.
++            self.running.sort(
++                key=lambda request: not self._is_origami_resume_request(request)
++            )
++
+         # Encoder-related.
+         scheduled_encoder_inputs: dict[str, list[int]] = {}
+         encoder_compute_budget = self.max_num_encoder_input_tokens
+@@ -374,6 +403,21 @@ class Scheduler(SchedulerInterface):
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+             request = self.running[req_index]
++            is_origami_resume = self._is_origami_resume_request(request)
++            if (
++                origami_fused_enabled
++                and is_origami_resume
++                and origami_fused_scheduled >= origami_fused_budget
++            ):
++                req_index += 1
++                continue
++            if (
++                origami_policy == "restored_only"
++                and origami_resume_pending
++                and self._is_origami_cold_prefill(request)
++            ):
++                req_index += 1
++                continue
+ 
+             if (
+                 request.num_output_placeholders > 0
+@@ -399,6 +443,14 @@ class Scheduler(SchedulerInterface):
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+             num_new_tokens = min(num_new_tokens, token_budget)
++            if (
++                origami_resume_pending
++                and self._is_origami_cold_prefill(request)
++            ):
++                num_new_tokens = min(
++                    num_new_tokens,
++                    int(getattr(origami_config, "cold_prefill_chunk_tokens", 1024)),
++                )
+ 
+             # Make sure the input position does not exceed the max model len.
+             # This is necessary when using spec decoding.
+@@ -505,6 +557,8 @@ class Scheduler(SchedulerInterface):
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
++            if origami_fused_enabled and is_origami_resume:
++                origami_fused_scheduled += 1
+             req_index += 1
+ 
+             # Speculative decode related.
+@@ -563,6 +617,23 @@ class Scheduler(SchedulerInterface):
+ 
+                 request = request_queue.peek_request()
+                 request_id = request.request_id
++                is_origami_resume = self._is_origami_resume_request(request)
++                if (
++                    origami_fused_enabled
++                    and is_origami_resume
++                    and origami_fused_scheduled >= origami_fused_budget
++                ):
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
++                if (
++                    origami_policy == "restored_only"
++                    and origami_resume_pending
++                    and self._is_origami_cold_prefill(request)
++                ):
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
+ 
+                 # try to promote blocked statuses while traversing skipped queue.
+                 if self._is_blocked_waiting_status(
+@@ -668,6 +739,20 @@ class Scheduler(SchedulerInterface):
+                         break
+ 
+                     num_new_tokens = min(num_new_tokens, token_budget)
++                    if (
++                        origami_resume_pending
++                        and self._is_origami_cold_prefill(request)
++                    ):
++                        num_new_tokens = min(
++                            num_new_tokens,
++                            int(
++                                getattr(
++                                    origami_config,
++                                    "cold_prefill_chunk_tokens",
++                                    1024,
++                                )
++                            ),
++                        )
+                     assert num_new_tokens > 0
+ 
+                     # Schedule encoder inputs.
+@@ -800,6 +885,8 @@ class Scheduler(SchedulerInterface):
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
++                if origami_fused_enabled and is_origami_resume:
++                    origami_fused_scheduled += 1
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 # Count the number of prefix cached tokens.
+@@ -1541,12 +1628,84 @@ class Scheduler(SchedulerInterface):
          else:
              self.waiting.add_request(request)
  
++    @staticmethod
++    def _is_origami_resume_request(request: Request) -> bool:
++        params = getattr(request, "kv_transfer_params", None)
++        if not isinstance(params, dict):
++            return False
++        if params.get("origami_save_prefill"):
++            return False
++        return bool(
++            params.get("origami_resume_prefill")
++            or params.get("origami_cache_key")
++            or params.get("origami_payload_id")
++        )
++
++    def _is_origami_cold_prefill(self, request: Request) -> bool:
++        return (
++            not self._is_origami_resume_request(request)
++            and request.num_computed_tokens < request.num_prompt_tokens
++        )
++
 +    def _request_has_origami_restore_priority(self, request: Request) -> bool:
 +        if (
 +            self.connector is None
@@ -15375,18 +17974,12 @@ index ea2c2a6..073c4fc 100644
 +        ):
 +            return False
 +        config = getattr(self.connector, "config", None)
-+        if getattr(config, "batch_policy", "restored_priority_mixed") != (
-+            "restored_priority_mixed"
-+        ):
++        if getattr(config, "batch_policy", "restored_priority_mixed") not in {
++            "restored_priority_mixed",
++            "restored_only",
++        }:
 +            return False
-+        params = getattr(request, "kv_transfer_params", None)
-+        if not isinstance(params, dict):
-+            return False
-+        return bool(
-+            params.get("origami_resume_prefill")
-+            or params.get("origami_cache_key")
-+            or params.get("origami_payload_id")
-+        )
++        return self._is_origami_resume_request(request)
 +
 +    def _promote_origami_restored_prefill(
 +        self, request_queue: RequestQueue
@@ -15436,3 +18029,493 @@ index ea2c2a6..073c4fc 100644
              waiting_req = self.waiting.peek_request()
              skipped_req = self.skipped_waiting.peek_request()
              return self.waiting if waiting_req < skipped_req else self.skipped_waiting
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index d7283b6..a8913bb 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -350,6 +350,9 @@ class CommonAttentionMetadata:
+ 
+     causal: bool = True
+ 
++    # Stable request identity for connector-specific attention backends.
++    request_ids: tuple[str, ...] | None = None
++
+     # Needed by FastPrefillAttentionBuilder
+     logits_indices_padded: torch.Tensor | None = None
+     num_logits_indices: int | None = None
+@@ -437,6 +440,11 @@ class CommonAttentionMetadata:
+             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
+             slot_mapping=self.slot_mapping[:num_actual_tokens],
+             causal=self.causal,
++            request_ids=(
++                self.request_ids[:num_actual_reqs]
++                if self.request_ids is not None
++                else None
++            ),
+             logits_indices_padded=self.logits_indices_padded,
+             num_logits_indices=self.num_logits_indices,
+             encoder_seq_lens=maybe_slice_reqs(self.encoder_seq_lens),
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+old mode 100644
+new mode 100755
+index f3f19f6..4050256
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -198,6 +198,17 @@ class FlashAttentionBackend(AttentionBackend):
+         return None
+ 
+ 
++@dataclass
++class _OrigamiAttentionPartition:
++    cold_req_indices: list[int]
++    cold_query_lens: list[int]
++    cold_query_start: list[int]
++    cold_token_indices: torch.Tensor
++    cold_req_tensor: torch.Tensor
++    cold_query_start_gpu: torch.Tensor
++    cold_query_start_cpu: torch.Tensor
++
++
+ @dataclass
+ class FlashAttentionMetadata:
+     # NOTE(sang): Definition of context_len, query_len, and seq_len.
+@@ -233,6 +244,11 @@ class FlashAttentionMetadata:
+     max_num_splits: int = 0
+ 
+     causal: bool = True
++    query_start_loc_cpu: torch.Tensor | None = None
++    request_ids: tuple[str, ...] | None = None
++    origami_partitions: dict[
++        tuple[int, ...], _OrigamiAttentionPartition
++    ] | None = None
+ 
+ 
+ def _get_sliding_window_configs(
+@@ -533,6 +549,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             prefix_scheduler_metadata=prefix_scheduler_metadata,
+             max_num_splits=max_num_splits,
+             causal=causal,
++            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
++            request_ids=common_attn_metadata.request_ids,
+         )
+         return attn_metadata
+ 
+@@ -628,6 +646,246 @@ class FlashAttentionImpl(AttentionImpl):
+         )
+         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+ 
++    def _try_origami_fused_forward(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata: FlashAttentionMetadata,
++        output: torch.Tensor,
++    ) -> bool:
++        request_ids = attn_metadata.request_ids
++        query_start_loc_cpu = attn_metadata.query_start_loc_cpu
++        if request_ids is None or query_start_loc_cpu is None:
++            return False
++        if self.attn_type != AttentionType.DECODER:
++            return False
++
++        from vllm.distributed.kv_transfer import (
++            get_kv_transfer_group,
++            has_kv_transfer_group,
++        )
++
++        if not has_kv_transfer_group():
++            return False
++        connector = get_kv_transfer_group()
++        get_runtime = getattr(connector, "get_fused_attention_runtime_config", None)
++        get_payloads = getattr(connector, "get_fused_layer_payloads", None)
++        get_batch_metadata = getattr(connector, "get_fused_batch_metadata", None)
++        get_stream_state = getattr(connector, "get_fused_attention_stream_state", None)
++        if not all(
++            callable(method)
++            for method in (
++                get_runtime,
++                get_payloads,
++                get_batch_metadata,
++                get_stream_state,
++            )
++        ):
++            return False
++
++        runtime = get_runtime()
++        if not runtime.get("enabled", False):
++            return False
++        query_positions, query_token_counts = get_batch_metadata()
++        candidate_request_ids = tuple(
++            request_id
++            for request_id in request_ids
++            if request_id in query_positions
++        )
++        if not candidate_request_ids:
++            return False
++        if (
++            self.alibi_slopes is not None
++            or self.sliding_window != (-1, -1)
++            or self.logits_soft_cap != 0
++            or self.sinks is not None
++            or self.head_size != 128
++            or self.kv_cache_dtype.startswith("fp8")
++        ):
++            raise RuntimeError(
++                "Origami fused payload reached an unsupported FlashAttention layer"
++            )
++
++        layer_name = getattr(layer, "layer_name", None)
++        if not isinstance(layer_name, str):
++            raise RuntimeError("Origami fused attention requires a named layer")
++        payloads = get_payloads(layer_name, candidate_request_ids)
++        missing = [
++            request_id
++            for request_id in candidate_request_ids
++            if request_id not in payloads
++        ]
++        if missing and runtime.get("mode") == "required":
++            raise RuntimeError(
++                "Origami fused payload is unavailable for layer "
++                f"{layer_name}: {missing}"
++            )
++        fused_request_ids = tuple(
++            request_id
++            for request_id in candidate_request_ids
++            if request_id in payloads
++        )
++        if not fused_request_ids:
++            return False
++        stream_state = get_stream_state()
++        if stream_state is None:
++            raise RuntimeError("Origami fused attention stream is unavailable")
++        fused_stream, qkv_ready, fused_done = stream_state
++
++        num_reqs = min(len(request_ids), int(query_start_loc_cpu.numel()) - 1)
++        starts = [int(value) for value in query_start_loc_cpu[: num_reqs + 1]]
++        fused_set = set(fused_request_ids)
++        fused_req_indices = [
++            index for index, request_id in enumerate(request_ids[:num_reqs])
++            if request_id in fused_set
++        ]
++        cold_req_indices = [
++            index for index in range(num_reqs) if index not in fused_req_indices
++        ]
++        for req_index in fused_req_indices:
++            request_id = request_ids[req_index]
++            query_tokens = starts[req_index + 1] - starts[req_index]
++            if query_tokens <= 0 or query_token_counts.get(request_id) != query_tokens:
++                raise RuntimeError(
++                    f"Origami fused query length mismatch for {request_id!r}"
++                )
++
++        current_stream = torch.cuda.current_stream(query.device)
++        qkv_ready.record(current_stream)
++        fused_stream.wait_event(qkv_ready)
++        execution = str(runtime.get("execution", "auto"))
++        parallel = bool(cold_req_indices) and (
++            execution == "parallel"
++            or (
++                execution == "auto"
++                and len(fused_req_indices) <= int(runtime.get("max_requests", 8))
++            )
++        )
++
++        from vllm.distributed.kv_transfer.kv_connector.v1.origami.fused_attention import (
++            run_fused_prefix_attention,
++        )
++
++        with torch.cuda.stream(fused_stream):
++            for req_index in fused_req_indices:
++                request_id = request_ids[req_index]
++                payload = payloads[request_id]
++                fused_stream.wait_event(payload.ready_event)
++                token_start = starts[req_index]
++                token_end = starts[req_index + 1]
++                query_slice = query[token_start:token_end].contiguous()
++                output_slice = torch.empty_like(query_slice)
++                query_start_position = int(query_positions[request_id])
++                sequence_length = query_start_position + token_end - token_start
++                run_fused_prefix_attention(
++                    payload,
++                    query=query_slice,
++                    kv_cache=kv_cache,
++                    block_table=attn_metadata.block_table[req_index].contiguous(),
++                    query_start_position=query_start_position,
++                    sequence_length=sequence_length,
++                    softmax_scale=self.scale,
++                    output=output_slice,
++                )
++                output[token_start:token_end].copy_(output_slice)
++                query_slice.record_stream(fused_stream)
++                output_slice.record_stream(fused_stream)
++                payload.symbols.record_stream(fused_stream)
++            fused_done.record(fused_stream)
++
++        if not parallel:
++            current_stream.wait_event(fused_done)
++
++        if cold_req_indices:
++            partition_key = tuple(fused_req_indices)
++            if attn_metadata.origami_partitions is None:
++                attn_metadata.origami_partitions = {}
++            partition = attn_metadata.origami_partitions.get(partition_key)
++            if partition is None:
++                cold_query_lens = [
++                    starts[index + 1] - starts[index]
++                    for index in cold_req_indices
++                ]
++                cold_query_start = [0]
++                for query_len in cold_query_lens:
++                    cold_query_start.append(cold_query_start[-1] + query_len)
++                cold_token_indices = torch.cat(
++                    [
++                        torch.arange(
++                            starts[index],
++                            starts[index + 1],
++                            dtype=torch.int64,
++                            device=query.device,
++                        )
++                        for index in cold_req_indices
++                    ]
++                )
++                cold_req_tensor = torch.tensor(
++                    cold_req_indices, dtype=torch.int64, device=query.device
++                )
++                partition = _OrigamiAttentionPartition(
++                    cold_req_indices=cold_req_indices,
++                    cold_query_lens=cold_query_lens,
++                    cold_query_start=cold_query_start,
++                    cold_token_indices=cold_token_indices,
++                    cold_req_tensor=cold_req_tensor,
++                    cold_query_start_gpu=torch.tensor(
++                        cold_query_start,
++                        dtype=torch.int32,
++                        device=query.device,
++                    ),
++                    cold_query_start_cpu=torch.tensor(
++                        cold_query_start, dtype=torch.int32
++                    ),
++                )
++                attn_metadata.origami_partitions[partition_key] = partition
++            cold_query_lens = partition.cold_query_lens
++            cold_query_start = partition.cold_query_start
++            cold_token_indices = partition.cold_token_indices
++            cold_req_tensor = partition.cold_req_tensor
++            cold_query = query.index_select(0, cold_token_indices).contiguous()
++            cold_key = key.index_select(0, cold_token_indices).contiguous()
++            cold_value = value.index_select(0, cold_token_indices).contiguous()
++            cold_output = torch.empty_like(cold_query)
++            cold_metadata = copy.copy(attn_metadata)
++            cold_metadata.num_actual_tokens = int(cold_query_start[-1])
++            cold_metadata.max_query_len = max(cold_query_lens)
++            cold_metadata.query_start_loc = partition.cold_query_start_gpu
++            cold_metadata.query_start_loc_cpu = partition.cold_query_start_cpu
++            cold_metadata.seq_lens = attn_metadata.seq_lens.index_select(
++                0, cold_req_tensor
++            )
++            cold_metadata.block_table = attn_metadata.block_table.index_select(
++                0, cold_req_tensor
++            )
++            cold_metadata.use_cascade = False
++            cold_metadata.common_prefix_len = 0
++            cold_metadata.scheduler_metadata = None
++            cold_metadata.prefix_scheduler_metadata = None
++            cold_metadata.cu_prefix_query_lens = None
++            cold_metadata.prefix_kv_lens = None
++            cold_metadata.suffix_kv_lens = None
++            cold_metadata.max_num_splits = 0
++            cold_metadata.request_ids = None
++            self.forward(
++                layer,
++                cold_query,
++                cold_key,
++                cold_value,
++                kv_cache,
++                cold_metadata,
++                output=cold_output,
++            )
++            output.index_copy_(0, cold_token_indices, cold_output)
++
++        if parallel:
++            current_stream.wait_event(fused_done)
++        output.record_stream(fused_stream)
++        return True
++
+     def forward(
+         self,
+         layer: torch.nn.Module,
+@@ -669,6 +927,11 @@ class FlashAttentionImpl(AttentionImpl):
+             # Profiling run.
+             return output.fill_(0)
+ 
++        if self._try_origami_fused_forward(
++            layer, query, key, value, kv_cache, attn_metadata, output
++        ):
++            return output
++
+         attn_type = self.attn_type
+ 
+         # IMPORTANT!
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 5354ef0..50f8f25 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -182,6 +182,7 @@ def build_attn_metadata(
+     kv_cache_config: KVCacheConfig,
+     dcp_local_seq_lens: torch.Tensor | None = None,
+     encoder_seq_lens: dict[int, tuple[torch.Tensor, np.ndarray]] | None = None,
++    request_ids: tuple[str, ...] | list[str] | None = None,
+ ) -> dict[str, Any]:
+     seq_lens = seq_lens[:num_reqs]
+     if dcp_local_seq_lens is not None:
+@@ -205,6 +206,7 @@ def build_attn_metadata(
+             slot_mapping=slot_mapping,
+             causal=True,
+             dcp_local_seq_lens=dcp_local_seq_lens,
++            request_ids=tuple(request_ids[:num_reqs]) if request_ids else None,
+         )
+         if encoder_seq_lens and i in encoder_seq_lens:
+             encoder_seq_lens_gpu, encoder_seq_lens_cpu = encoder_seq_lens[i]
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 24df137..adceb21 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -77,6 +77,9 @@ class InputBatch:
+     # Whether any requests in batch use structured output.
+     has_structured_output_reqs: bool
+ 
++    # Populated only when Origami fused-prefix attention is active this step.
++    origami_fused_request_ids: tuple[str, ...] | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 57f170b..8d3e3b5 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -903,6 +903,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_tokens_across_dp = None
+ 
+         skip_compiled = False
++        has_origami_fused_requests = bool(
++            getattr(
++                scheduler_output.kv_connector_metadata,
++                "fused_request_ids",
++                (),
++            )
++        )
++        if has_origami_fused_requests:
++            skip_compiled = True
++            batch_desc = BatchExecutionDescriptor(
++                cg_mode=CUDAGraphMode.NONE,
++                num_tokens=num_toks,
++                num_reqs=num_reqs,
++            )
+         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+             # Encoder-decoder models such as Whisper should run eager/non-compiled
+             # when encoder inputs are scheduled, because this step updates
+@@ -935,6 +949,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Common case.
+             # Prepare all the inputs and copy to the input buffers.
+             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
++            input_batch.origami_fused_request_ids = (
++                tuple(input_batch.req_ids)
++                if has_origami_fused_requests
++                else None
++            )
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
+ 
+             if self.lora_config:
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 104e4c1..561549e 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -163,5 +163,6 @@ class DefaultModelState(ModelState):
+             slot_mappings=slot_mappings,
+             kv_cache_config=kv_cache_config,
+             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
++            request_ids=input_batch.origami_fused_request_ids,
+         )
+         return attn_metadata
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 98e1dab..e7283e5 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1897,6 +1897,7 @@ class GPUModelRunner(
+         num_scheduled_tokens: dict[str, int] | None = None,
+         cascade_attn_prefix_lens: list[list[int]] | None = None,
+         slot_mappings: dict[int, torch.Tensor] | None = None,
++        request_ids: tuple[str, ...] | None = None,
+     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+         """
+         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+@@ -1973,6 +1974,7 @@ class GPUModelRunner(
+             block_table_tensor=block_table_gid_0,
+             slot_mapping=slot_mapping_gid_0,
+             causal=True,
++            request_ids=request_ids,
+         )
+ 
+         if self.dcp_world_size > 1:
+@@ -3621,6 +3623,13 @@ class GPUModelRunner(
+             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
++            has_origami_fused_requests = bool(
++                getattr(
++                    scheduler_output.kv_connector_metadata,
++                    "fused_request_ids",
++                    (),
++                )
++            )
+ 
+             logits_indices, spec_decode_metadata = self._prepare_inputs(
+                 scheduler_output,
+@@ -3649,6 +3658,8 @@ class GPUModelRunner(
+                 num_scheduled_tokens_np=num_scheduled_tokens_np,
+                 max_num_scheduled_tokens=max_num_scheduled_tokens,
+                 use_cascade_attn=cascade_attn_prefix_lens is not None,
++                allow_microbatching=not has_origami_fused_requests,
++                force_eager=has_origami_fused_requests,
+                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+             )
+ 
+@@ -3732,6 +3743,9 @@ class GPUModelRunner(
+                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                     slot_mappings=slot_mappings_by_group,
++                    request_ids=(
++                        tuple(req_ids) if has_origami_fused_requests else None
++                    ),
+                 )
+             )
+ 
+@@ -3776,7 +3790,7 @@ class GPUModelRunner(
+                 batch_descriptor=batch_desc,
+                 ubatch_slices=ubatch_slices_padded,
+                 slot_mapping=slot_mappings,
+-                skip_compiled=has_encoder_input,
++                skip_compiled=has_encoder_input or has_origami_fused_requests,
+             ),
+             record_function_or_nullcontext("gpu_model_runner: forward"),
+             self.maybe_get_kv_connector_output(
+diff --git a/vllm/v1/worker/ubatch_utils.py b/vllm/v1/worker/ubatch_utils.py
+index 7c41726..2efa481 100644
+--- a/vllm/v1/worker/ubatch_utils.py
++++ b/vllm/v1/worker/ubatch_utils.py
+@@ -223,6 +223,11 @@ def _make_metadata_with_slice(
+         slot_mapping=slot_mapping,
+         _seq_lens_cpu=seq_lens_cpu,
+         _num_computed_tokens_cpu=num_computed_tokens_cpu,
++        request_ids=(
++            attn_metadata.request_ids[request_slice]
++            if attn_metadata.request_ids is not None
++            else None
++        ),
+     )
+ 
+ 

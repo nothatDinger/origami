@@ -37,14 +37,14 @@ def load_bitpack_cuda_extension() -> Any:
     if not torch.cuda.is_available():
         raise RuntimeError("Origami CUDA bitpack extension requires CUDA")
     return load(
-        name="origami_bitpack_cuda_v5",
+        name="origami_bitpack_cuda_v6",
         sources=[
             str(_CSRC / "bitpack_layout_cuda.cpp"),
             str(_CSRC / "bitpack_layout_cuda.cu"),
         ],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3"],
-        build_directory=_build_dir("bitpack_cuda_v5"),
+        build_directory=_build_dir("bitpack_cuda_v6"),
         verbose=_VERBOSE,
     )
 
@@ -258,4 +258,167 @@ def kivi_dequantize_to_kv_cache(
         int(tokens),
         int(heads),
         int(head_dim),
+    )
+
+
+def _fp16_blob_view(
+    bytestream: torch.Tensor,
+    metadata: dict[str, Any],
+    name: str,
+) -> torch.Tensor:
+    offset = int(metadata[f"{name}_offset"])
+    numel = int(metadata[f"{name}_numel"])
+    byte_count = numel * torch.empty((), dtype=torch.float16).element_size()
+    if offset < 0 or offset + byte_count > int(bytestream.numel()):
+        raise ValueError(f"{name} range exceeds the Origami artifact")
+    if offset % 2:
+        raise ValueError(f"{name} must be aligned for float16 access")
+    return bytestream.narrow(0, offset, byte_count).view(torch.float16)
+
+
+def _fused_prefix_attention(
+    bytestream: torch.Tensor,
+    *,
+    codec: int,
+    metadata: dict[str, Any],
+    key_scale: torch.Tensor,
+    key_zero: torch.Tensor,
+    value_scale: torch.Tensor,
+    value_zero: torch.Tensor,
+    key_sink: torch.Tensor,
+    value_sink: torch.Tensor,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_position: int,
+    sequence_length: int,
+    softmax_scale: float,
+    output: torch.Tensor,
+) -> None:
+    if bytestream.device != query.device or query.device != kv_cache.device:
+        raise ValueError("compressed payload, query, and KV cache must share a device")
+    if query.ndim != 3 or output.shape != query.shape:
+        raise ValueError("query and output must be matching rank-3 tensors")
+    if kv_cache.ndim != 5 or int(kv_cache.shape[0]) != 2:
+        raise ValueError(
+            "fused attention requires NHD KV cache shape "
+            "[2, blocks, block, heads, dim]"
+        )
+    if int(metadata["head_dim"]) != int(query.shape[2]):
+        raise ValueError("artifact head_dim does not match query")
+    if int(metadata["num_heads"]) != int(kv_cache.shape[3]):
+        raise ValueError("artifact KV head count does not match KV cache")
+    if int(kv_cache.shape[4]) != int(query.shape[2]):
+        raise ValueError("KV cache head_dim does not match query")
+    declared_bytes = int(metadata.get("symbol_byte_count", bytestream.numel()))
+    if declared_bytes != int(bytestream.numel()):
+        raise ValueError("artifact byte count does not match compressed payload")
+    if int(query_start_position) < int(metadata["token_count"]):
+        raise ValueError("query starts inside the compressed prefix")
+    ext = load_bitpack_cuda_extension()
+    ext.fused_prefix_attention_cuda(
+        bytestream.reshape(-1).contiguous(),
+        int(metadata["key_stream_offset"]),
+        int(metadata["key_stream_bytes"]),
+        int(metadata["value_stream_offset"]),
+        int(metadata["value_stream_bytes"]),
+        int(codec),
+        int(metadata["bits"]),
+        int(metadata.get("group_size", 1)),
+        int(metadata.get("sink_tokens", 0)),
+        key_scale.contiguous(),
+        key_zero.contiguous(),
+        value_scale.contiguous(),
+        value_zero.contiguous(),
+        key_sink.contiguous(),
+        value_sink.contiguous(),
+        query.contiguous(),
+        kv_cache,
+        block_table.to(device=kv_cache.device, dtype=torch.int32).contiguous(),
+        int(metadata["token_count"]),
+        int(query_start_position),
+        int(sequence_length),
+        float(softmax_scale),
+        output,
+    )
+
+
+def kivi_fused_prefix_attention(
+    bytestream: torch.Tensor,
+    *,
+    metadata: dict[str, Any],
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_position: int,
+    sequence_length: int,
+    softmax_scale: float,
+    output: torch.Tensor,
+) -> None:
+    if str(metadata.get("format")) != "kivi_structured_blob":
+        raise ValueError("KIVI fused attention requires a structured KIVI artifact")
+    if tuple(metadata.get("key_order", ())) != (
+        "head_dim", "layer", "head", "token"
+    ) or tuple(metadata.get("value_order", ())) != (
+        "head", "layer", "head_dim", "token"
+    ):
+        raise ValueError("KIVI artifact has an unsupported packed layout")
+    _fused_prefix_attention(
+        bytestream,
+        codec=0,
+        metadata=metadata,
+        key_scale=_fp16_blob_view(bytestream, metadata, "key_scale"),
+        key_zero=_fp16_blob_view(bytestream, metadata, "key_zero"),
+        value_scale=_fp16_blob_view(bytestream, metadata, "value_scale"),
+        value_zero=_fp16_blob_view(bytestream, metadata, "value_zero"),
+        key_sink=_fp16_blob_view(bytestream, metadata, "key_sink"),
+        value_sink=_fp16_blob_view(bytestream, metadata, "value_sink"),
+        query=query,
+        kv_cache=kv_cache,
+        block_table=block_table,
+        query_start_position=query_start_position,
+        sequence_length=sequence_length,
+        softmax_scale=softmax_scale,
+        output=output,
+    )
+
+
+def kvquant_fused_prefix_attention(
+    bytestream: torch.Tensor,
+    *,
+    metadata: dict[str, Any],
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_start_position: int,
+    sequence_length: int,
+    softmax_scale: float,
+    output: torch.Tensor,
+) -> None:
+    if str(metadata.get("format")) != "kvquant_structured_blob":
+        raise ValueError("KVQuant fused attention requires a structured artifact")
+    if tuple(metadata.get("key_order", ())) != (
+        "head_dim", "layer", "head", "token"
+    ) or tuple(metadata.get("value_order", ())) != (
+        "layer", "head", "token", "head_dim"
+    ):
+        raise ValueError("KVQuant artifact has an unsupported packed layout")
+    empty = torch.empty((0,), dtype=torch.float16, device=bytestream.device)
+    _fused_prefix_attention(
+        bytestream,
+        codec=1,
+        metadata=metadata,
+        key_scale=_fp16_blob_view(bytestream, metadata, "key_scale"),
+        key_zero=_fp16_blob_view(bytestream, metadata, "key_min"),
+        value_scale=_fp16_blob_view(bytestream, metadata, "value_scale"),
+        value_zero=_fp16_blob_view(bytestream, metadata, "value_min"),
+        key_sink=empty,
+        value_sink=empty,
+        query=query,
+        kv_cache=kv_cache,
+        block_table=block_table,
+        query_start_position=query_start_position,
+        sequence_length=sequence_length,
+        softmax_scale=softmax_scale,
+        output=output,
     )

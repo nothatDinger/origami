@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.config import (
     OrigamiConfig,
     _parse_ratio,
+    fused_attention_compatibility,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.origami.lossless.pipeline import (
     select_gpu_lossless_requests,
@@ -123,7 +124,11 @@ class OrigamiConnectorScheduler:
         self.config = config
         self.block_size = vllm_config.cache_config.block_size
         self.controller = OrigamiOffloadController(config)
+        self.fused_enabled, self.fused_disabled_reason = (
+            fused_attention_compatibility(vllm_config, config)
+        )
         self._restored_requests: set[str] = set()
+        self._restored_prefix_tokens: dict[str, int] = {}
         self._pending_restores: dict[str, OrigamiRestoreRequest] = {}
         self._save_candidates: dict[str, _SavePlan] = {}
         self._last_observed_pcie_gbps = 0.0
@@ -190,11 +195,18 @@ class OrigamiConnectorScheduler:
             metric_request_id=_metric_request_id(request),
         )
         self._restored_requests.add(req_id)
+        self._restored_prefix_tokens[req_id] = int(num_external_tokens)
 
     def build_connector_meta(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> OrigamiConnectorMetadata:
+        # Preemption frees the paged blocks but not the worker's compressed
+        # payload. Permit the request to match the external prefix again so
+        # the allocator reserves replacement logical blocks.
+        self._restored_requests.difference_update(
+            scheduler_output.preempted_req_ids or set()
+        )
         ratio = self.controller.observe_schedule_step(self._last_observed_pcie_gbps)
         request_ids = sorted(self._pending_restores)
         gpu_request_ids = select_gpu_lossless_requests(request_ids, ratio)
@@ -211,11 +223,59 @@ class OrigamiConnectorScheduler:
             )
 
         saves = self._build_save_metadata(scheduler_output)
+        fused_request_ids: tuple[str, ...] = ()
+        fused_query_start_positions: dict[str, int] = {}
+        fused_query_token_counts: dict[str, int] = {}
+        fused_request_indices: dict[str, int] = {}
+        fused_codecs: dict[str, str] = {}
+        fused_prefix_lengths: dict[str, int] = {}
+        if self.fused_enabled:
+            fused_request_ids = tuple(
+                req_id
+                for req_id in scheduler_output.num_scheduled_tokens
+                if req_id in self._restored_requests
+            )
+            fused_set = set(fused_request_ids)
+            for request in scheduler_output.scheduled_new_reqs:
+                if request.req_id in fused_set:
+                    fused_query_start_positions[request.req_id] = int(
+                        request.num_computed_tokens
+                    )
+            cached = scheduler_output.scheduled_cached_reqs
+            for req_id, num_computed_tokens in zip(
+                cached.req_ids, cached.num_computed_tokens
+            ):
+                if req_id in fused_set:
+                    fused_query_start_positions[req_id] = int(num_computed_tokens)
+            fused_query_token_counts = {
+                req_id: int(scheduler_output.num_scheduled_tokens[req_id])
+                for req_id in fused_request_ids
+            }
+            fused_request_indices = {
+                req_id: index
+                for index, req_id in enumerate(
+                    scheduler_output.num_scheduled_tokens
+                )
+                if req_id in fused_set
+            }
+            fused_codecs = {
+                req_id: self.config.quantizer for req_id in fused_request_ids
+            }
+            fused_prefix_lengths = {
+                req_id: int(self._restored_prefix_tokens[req_id])
+                for req_id in fused_request_ids
+            }
         self._pending_restores.clear()
         return OrigamiConnectorMetadata(
             reqs_to_restore=restores,
             reqs_to_save=saves,
             gpu_lossless_ratio=ratio,
+            fused_request_ids=fused_request_ids,
+            fused_query_start_positions=fused_query_start_positions,
+            fused_query_token_counts=fused_query_token_counts,
+            fused_request_indices=fused_request_indices,
+            fused_codecs=fused_codecs,
+            fused_prefix_lengths=fused_prefix_lengths,
         )
 
     def _build_save_metadata(
@@ -277,4 +337,5 @@ class OrigamiConnectorScheduler:
     def request_finished(self, request: "Request") -> None:
         req_id = request.request_id
         self._restored_requests.discard(req_id)
+        self._restored_prefix_tokens.pop(req_id, None)
         self._save_candidates.pop(req_id, None)

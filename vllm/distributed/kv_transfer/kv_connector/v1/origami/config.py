@@ -16,6 +16,8 @@ NormalizedGpuLosslessRatio = Literal["auto", 0, 25, 50, 75, 100]
 OrigamiArtifactFormat = Literal["auto", "bundle_v1", "legacy_pt"]
 OrigamiDevicePolicy = Literal["auto", "cpu", "gpu", "cuda"]
 OrigamiNvcompBackend = Literal["disabled", "nvcomp_deflate", "nvcomp_gdeflate"]
+OrigamiFusedAttentionMode = Literal["off", "auto", "required"]
+OrigamiFusedExecutionMode = Literal["auto", "parallel", "serial"]
 
 
 def _get_extra(vllm_config: VllmConfig, key: str, default: Any) -> Any:
@@ -78,6 +80,11 @@ class OrigamiConfig:
     metrics_dir: str = ""
     dequant_device: str = "auto"
     bitunpack_device: OrigamiDevicePolicy = "auto"
+    fused_attention: OrigamiFusedAttentionMode = "off"
+    fused_execution: OrigamiFusedExecutionMode = "auto"
+    fused_stream_priority: int = -1
+    cold_prefill_chunk_tokens: int = 1024
+    fused_max_requests: int = 8
 
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "OrigamiConfig":
@@ -191,6 +198,21 @@ class OrigamiConfig:
             ),
             dequant_device=dequant_device,
             bitunpack_device=bitunpack_device,
+            fused_attention=str(
+                _get_extra(vllm_config, "origami_fused_attention", "off")
+            ).lower(),
+            fused_execution=str(
+                _get_extra(vllm_config, "origami_fused_execution", "auto")
+            ).lower(),
+            fused_stream_priority=int(
+                _get_extra(vllm_config, "origami_fused_stream_priority", -1)
+            ),
+            cold_prefill_chunk_tokens=int(
+                _get_extra(vllm_config, "origami_cold_prefill_chunk_tokens", 1024)
+            ),
+            fused_max_requests=int(
+                _get_extra(vllm_config, "origami_fused_max_requests", 8)
+            ),
         )
         config.validate()
         return config
@@ -250,8 +272,74 @@ class OrigamiConfig:
             raise ValueError(
                 "origami_bitunpack_device must be one of {'auto', 'cpu', 'gpu', 'cuda'}"
             )
+        if self.fused_attention not in {"off", "auto", "required"}:
+            raise ValueError(
+                "origami_fused_attention must be one of {'off', 'auto', 'required'}"
+            )
+        if self.fused_execution not in {"auto", "parallel", "serial"}:
+            raise ValueError(
+                "origami_fused_execution must be one of "
+                "{'auto', 'parallel', 'serial'}"
+            )
+        if self.cold_prefill_chunk_tokens <= 0:
+            raise ValueError("origami_cold_prefill_chunk_tokens must be positive")
+        if self.fused_max_requests <= 0:
+            raise ValueError("origami_fused_max_requests must be positive")
 
     def effective_qat_pipeline_target_chunks(self) -> int:
         if self.qat_pipeline_target_chunks > 0:
             return int(self.qat_pipeline_target_chunks)
         return max(1, int(self.qat_max_instances) * 4)
+
+
+def fused_attention_compatibility(
+    vllm_config: VllmConfig,
+    config: OrigamiConfig,
+) -> tuple[bool, str]:
+    """Return whether the first-generation Origami fused path is supported.
+
+    Device capability is checked by the worker after CUDA initialization.  The
+    checks here deliberately fail closed for execution modes that require
+    cross-rank attention state or change the paged-cache semantics.
+    """
+    if config.fused_attention == "off":
+        return False, "origami_fused_attention is off"
+    if config.quantizer not in {"kivi", "kvquant"}:
+        return False, "fused attention supports only kivi and kvquant"
+    if config.batch_policy == "pure_vllm_baseline":
+        return False, "pure_vllm_baseline disables Origami fused attention"
+
+    parallel = vllm_config.parallel_config
+    if int(parallel.tensor_parallel_size) != 1:
+        return False, "fused attention currently requires tensor_parallel_size=1"
+    if int(parallel.pipeline_parallel_size) != 1:
+        return False, "fused attention currently requires pipeline_parallel_size=1"
+    if int(parallel.data_parallel_size) != 1:
+        return False, "fused attention currently requires data_parallel_size=1"
+    if int(parallel.decode_context_parallel_size) != 1:
+        return False, "fused attention does not support decode context parallelism"
+    if vllm_config.speculative_config is not None:
+        return False, "fused attention does not support speculative decoding"
+
+    model = vllm_config.model_config
+    if model.is_encoder_decoder:
+        return False, "fused attention does not support cross-attention"
+    if model.use_mla:
+        return False, "fused attention does not support MLA"
+
+    cache_dtype = str(vllm_config.cache_config.cache_dtype)
+    if cache_dtype.startswith("fp8"):
+        return False, "fused attention does not support FP8 KV cache"
+    if vllm_config.cache_config.sliding_window is not None:
+        return False, "fused attention does not support sliding-window attention"
+
+    dtype = str(vllm_config.model_config.dtype).replace("torch.", "")
+    if dtype not in {"float16", "bfloat16"}:
+        return False, "fused attention requires float16 or bfloat16 activations"
+    if int(vllm_config.model_config.get_head_size()) != 128:
+        return False, "fused attention currently requires head_size=128"
+
+    model_type = str(getattr(vllm_config.model_config.hf_config, "model_type", ""))
+    if model_type not in {"llama", "mistral"}:
+        return False, "fused attention currently supports Llama and Mistral models"
+    return True, ""

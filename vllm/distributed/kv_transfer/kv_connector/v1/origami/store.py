@@ -47,6 +47,14 @@ def _codec_uses_qat_bundle(codec: str) -> bool:
     return normalized not in {"raw", "identity"} and not normalized.startswith("nvcomp")
 
 
+def _uses_native_qat_bundle_format(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(8) == b"ORIGQZ1\0"
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class PreparedChunkGroup:
     layer_name: str
@@ -272,7 +280,7 @@ class LocalFileOrigamiStore(OrigamiStore):
         if (
             lossless_backend == "qat"
             and native_cpu.qat_codec() == "qat_codec"
-            and self._qat_bundle_path(cache_key).exists()
+            and _uses_native_qat_bundle_format(self._qat_bundle_path(cache_key))
         ):
             bundle_path = self._qat_bundle_path(cache_key)
             payload = self._payload_from_manifest(manifest, compressed_data=None)
@@ -448,6 +456,9 @@ class LocalFileOrigamiStore(OrigamiStore):
             return self._payload_from_manifest(manifest, data)
 
         payload_path = self._payload_path(cache_key)
+        ingress_mode = str(artifact_ingress_mode).lower().replace("_", "-")
+        if ingress_mode == "native-file":
+            ingress_mode = "file"
         data = controlled_read(
             payload_path,
             request_id=request_id,
@@ -455,7 +466,7 @@ class LocalFileOrigamiStore(OrigamiStore):
             system=system,
             bandwidth_gbps=read_bandwidth_gbps,
             metrics_path=metrics_path,
-            ingress_mode=artifact_ingress_mode,
+            ingress_mode=ingress_mode,
         )
         bytestream = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         payload = self._payload_from_manifest(manifest, compressed_data=None)

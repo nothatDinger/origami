@@ -84,3 +84,9 @@ class OrigamiConnectorMetadata(KVConnectorMetadata):
     reqs_to_restore: dict[str, OrigamiRestoreRequest] = field(default_factory=dict)
     reqs_to_save: dict[str, OrigamiSaveRequest] = field(default_factory=dict)
     gpu_lossless_ratio: int = 0
+    fused_request_ids: tuple[str, ...] = ()
+    fused_query_start_positions: dict[str, int] = field(default_factory=dict)
+    fused_query_token_counts: dict[str, int] = field(default_factory=dict)
+    fused_request_indices: dict[str, int] = field(default_factory=dict)
+    fused_codecs: dict[str, str] = field(default_factory=dict)
+    fused_prefix_lengths: dict[str, int] = field(default_factory=dict)

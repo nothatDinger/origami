@@ -83,6 +83,44 @@ Useful QAT tuning fields:
 }
 ```
 
+## Quantized-prefix fused attention
+
+KIVI and KVQuant prefixes can remain compressed on the GPU and be consumed by
+Origami's CUDA online-softmax attention kernel. A mixed batch runs this work on
+a reusable high-priority stream while cold prefill remains on FlashAttention's
+current stream:
+
+```json
+{
+  "origami_quantizer": "kivi",
+  "origami_quantizer_config": {
+    "bits": 4,
+    "group_size": 64,
+    "sink_tokens": 128
+  },
+  "origami_fused_attention": "auto",
+  "origami_fused_execution": "auto",
+  "origami_fused_stream_priority": -1,
+  "origami_cold_prefill_chunk_tokens": 1024,
+  "origami_fused_max_requests": 8,
+  "origami_batch_policy": "restored_priority_mixed"
+}
+```
+
+`origami_fused_attention` defaults to `off`. `auto` falls back to explicit
+dequantization when an artifact or execution mode is incompatible; `required`
+fails startup or restore instead. `origami_fused_execution` accepts `auto`,
+`parallel`, or `serial`. The other batch policies are `restored_only`, which
+does not admit cold prefill while restored work is present, and
+`pure_vllm_baseline`, which disables fused attention and Origami scheduling
+priority.
+
+The first fused implementation requires NVIDIA SM80+, TP/PP/DP/DCP 1,
+FP16/BF16, head size 128, standard Llama or Mistral decoder self-attention, and
+the NHD paged-KV layout. It does not support FP8 KV cache, speculative decoding,
+sliding-window or cross-attention, MLA, or full CUDA Graph execution. Fused
+batches use eager execution; ordinary batches retain the configured graph mode.
+
 ## Patch Workflow
 
 Regenerate the patch after changing the vLLM fork:

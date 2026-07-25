@@ -278,6 +278,41 @@ void origami_kivi_dequantize_to_kv_cache_launch(
     int64_t head_dim,
     cudaStream_t stream);
 
+void origami_fused_prefix_attention_launch(
+    const uint8_t* bytestream,
+    int64_t key_offset,
+    int64_t key_bytes,
+    int64_t value_offset,
+    int64_t value_bytes,
+    int codec,
+    int bits,
+    int64_t group_size,
+    int64_t sink_tokens,
+    const void* key_scale,
+    const void* key_zero,
+    const void* value_scale,
+    const void* value_zero,
+    const void* key_sink,
+    const void* value_sink,
+    const void* query,
+    const void* kv_cache,
+    const int32_t* block_table,
+    void* output,
+    bool query_is_bfloat16,
+    bool cache_is_bfloat16,
+    bool cache_blocks_first,
+    int64_t num_cache_blocks,
+    int64_t block_size,
+    int64_t prefix_tokens,
+    int64_t query_start_position,
+    int64_t sequence_length,
+    int64_t query_tokens,
+    int64_t query_heads,
+    int64_t kv_heads,
+    int64_t head_dim,
+    float softmax_scale,
+    cudaStream_t stream);
+
 at::Tensor unpack_canonical_storage_chunks_cuda(
     at::Tensor flat_chunks,
     at::Tensor chunk_offsets,
@@ -678,6 +713,184 @@ void kivi_dequantize_to_kv_cache_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void fused_prefix_attention_cuda(
+    at::Tensor bytestream,
+    int64_t key_offset,
+    int64_t key_bytes,
+    int64_t value_offset,
+    int64_t value_bytes,
+    int64_t codec,
+    int64_t bits,
+    int64_t group_size,
+    int64_t sink_tokens,
+    at::Tensor key_scale,
+    at::Tensor key_zero,
+    at::Tensor value_scale,
+    at::Tensor value_zero,
+    at::Tensor key_sink,
+    at::Tensor value_sink,
+    at::Tensor query,
+    at::Tensor kv_cache,
+    at::Tensor block_table,
+    int64_t prefix_tokens,
+    int64_t query_start_position,
+    int64_t sequence_length,
+    double softmax_scale,
+    at::Tensor output) {
+  check_cuda_contiguous(bytestream, "bytestream");
+  check_cuda_contiguous(key_scale, "key_scale");
+  check_cuda_contiguous(key_zero, "key_zero");
+  check_cuda_contiguous(value_scale, "value_scale");
+  check_cuda_contiguous(value_zero, "value_zero");
+  check_cuda_contiguous(key_sink, "key_sink");
+  check_cuda_contiguous(value_sink, "value_sink");
+  check_cuda_contiguous(query, "query");
+  check_cuda_contiguous(kv_cache, "kv_cache");
+  check_cuda_contiguous(block_table, "block_table");
+  check_cuda_contiguous(output, "output");
+  TORCH_CHECK(bytestream.scalar_type() == at::kByte,
+              "bytestream must be uint8");
+  TORCH_CHECK(codec == 0 || codec == 1,
+              "codec must be 0 (KIVI) or 1 (KVQuant)");
+  TORCH_CHECK(bits == 2 || bits == 3 || bits == 4 || bits == 8,
+              "fused attention supports 2, 3, 4, or 8 bits");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(prefix_tokens > 0, "prefix_tokens must be positive");
+  TORCH_CHECK(sink_tokens >= 0 && sink_tokens <= prefix_tokens,
+              "sink_tokens must be in [0, prefix_tokens]");
+  TORCH_CHECK(key_offset >= 0 && key_bytes >= 0 && value_offset >= 0 &&
+                  value_bytes >= 0,
+              "invalid compressed stream offsets");
+  TORCH_CHECK(key_offset + key_bytes <= bytestream.numel() &&
+                  value_offset + value_bytes <= bytestream.numel(),
+              "compressed stream ranges exceed bytestream length");
+  TORCH_CHECK(query.dim() == 3,
+              "query must have shape [query_tokens, query_heads, head_dim]");
+  TORCH_CHECK(output.sizes() == query.sizes(),
+              "output must have the same shape as query");
+  TORCH_CHECK(query.scalar_type() == at::kHalf ||
+                  query.scalar_type() == at::kBFloat16,
+              "query must be float16 or bfloat16");
+  TORCH_CHECK(output.scalar_type() == query.scalar_type(),
+              "output dtype must match query dtype");
+  TORCH_CHECK(kv_cache.scalar_type() == at::kHalf ||
+                  kv_cache.scalar_type() == at::kBFloat16,
+              "kv_cache must be float16 or bfloat16");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt,
+              "block_table must be int32");
+  TORCH_CHECK(block_table.dim() == 1,
+              "block_table must be one-dimensional");
+  TORCH_CHECK(kv_cache.dim() == 5, "kv_cache must have rank 5");
+
+  const auto device = bytestream.device();
+  for (const auto& tensor : {key_scale, key_zero, value_scale, value_zero,
+                             key_sink, value_sink, query, kv_cache,
+                             block_table, output}) {
+    TORCH_CHECK(tensor.device() == device,
+                "all fused-attention tensors must be on the same CUDA device");
+  }
+  for (const auto& tensor : {key_scale, key_zero, value_scale, value_zero,
+                             key_sink, value_sink}) {
+    TORCH_CHECK(tensor.scalar_type() == at::kHalf,
+                "compressed metadata tensors must be float16");
+  }
+
+  const int64_t query_tokens = query.size(0);
+  const int64_t query_heads = query.size(1);
+  const int64_t head_dim = query.size(2);
+  TORCH_CHECK(query_tokens > 0 && query_heads > 0,
+              "query token and head counts must be positive");
+  TORCH_CHECK(head_dim == 128,
+              "the first Origami fused kernel supports head_dim 128 only");
+
+  bool cache_blocks_first = false;
+  int64_t num_cache_blocks = 0;
+  int64_t block_size = 0;
+  int64_t kv_heads = 0;
+  // FlashAttention exposes its paged cache as [2, blocks, block, heads, dim].
+  // Check this layout first because num_cache_blocks == 2 is otherwise
+  // ambiguous with the legacy [blocks, 2, block, heads, dim] representation.
+  if (kv_cache.size(0) == 2) {
+    cache_blocks_first = false;
+    num_cache_blocks = kv_cache.size(1);
+    block_size = kv_cache.size(2);
+    kv_heads = kv_cache.size(3);
+    TORCH_CHECK(kv_cache.size(4) == head_dim,
+                "kv_cache head_dim does not match query");
+  } else if (kv_cache.size(1) == 2) {
+    cache_blocks_first = true;
+    num_cache_blocks = kv_cache.size(0);
+    block_size = kv_cache.size(2);
+    kv_heads = kv_cache.size(3);
+    TORCH_CHECK(kv_cache.size(4) == head_dim,
+                "kv_cache head_dim does not match query");
+  } else {
+    TORCH_CHECK(false,
+                "kv_cache must be [num_blocks,2,block,heads,dim] or "
+                "[2,num_blocks,block,heads,dim]");
+  }
+  TORCH_CHECK(kv_heads > 0 && query_heads % kv_heads == 0,
+              "query_heads must be divisible by kv_heads");
+  TORCH_CHECK(block_size > 0 && num_cache_blocks > 0,
+              "kv_cache block dimensions must be positive");
+  TORCH_CHECK(query_start_position >= prefix_tokens,
+              "query must start at or after the compressed prefix");
+  TORCH_CHECK(sequence_length > 0 &&
+                  query_start_position + query_tokens <= sequence_length,
+              "query range exceeds sequence length");
+  const int64_t logical_blocks =
+      (sequence_length + block_size - 1) / block_size;
+  TORCH_CHECK(block_table.numel() >= logical_blocks,
+              "block_table is too short for sequence_length");
+
+  const int64_t channels = kv_heads * head_dim;
+  const int64_t body_tokens = prefix_tokens - sink_tokens;
+  const auto packed_bytes = [bits](int64_t symbols) {
+    return bits == 3 ? (symbols + 1) / 2 : (symbols * bits + 7) / 8;
+  };
+  const int64_t stream_tokens = codec == 0 ? body_tokens : prefix_tokens;
+  TORCH_CHECK(key_bytes >= packed_bytes(stream_tokens * channels) &&
+                  value_bytes >= packed_bytes(stream_tokens * channels),
+              "compressed K/V streams are smaller than their declared shape");
+  if (codec == 0) {
+    const int64_t key_groups =
+        (body_tokens + group_size - 1) / group_size;
+    const int64_t value_groups =
+        (channels + group_size - 1) / group_size;
+    TORCH_CHECK(key_scale.numel() >= key_groups * channels &&
+                    key_zero.numel() >= key_groups * channels,
+                "KIVI key metadata is too small");
+    TORCH_CHECK(value_scale.numel() >= body_tokens * value_groups &&
+                    value_zero.numel() >= body_tokens * value_groups,
+                "KIVI value metadata is too small");
+    TORCH_CHECK(key_sink.numel() >= sink_tokens * channels &&
+                    value_sink.numel() >= sink_tokens * channels,
+                "KIVI sink tensors are too small");
+  } else {
+    TORCH_CHECK(key_scale.numel() >= channels && key_zero.numel() >= channels,
+                "KVQuant key metadata is too small");
+    TORCH_CHECK(value_scale.numel() >= prefix_tokens &&
+                    value_zero.numel() >= prefix_tokens,
+                "KVQuant value metadata is too small");
+  }
+
+  const c10::cuda::CUDAGuard device_guard(device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  origami_fused_prefix_attention_launch(
+      bytestream.data_ptr<uint8_t>(), key_offset, key_bytes, value_offset,
+      value_bytes, static_cast<int>(codec), static_cast<int>(bits), group_size,
+      sink_tokens, key_scale.data_ptr(), key_zero.data_ptr(),
+      value_scale.data_ptr(), value_zero.data_ptr(), key_sink.data_ptr(),
+      value_sink.data_ptr(), query.data_ptr(), kv_cache.data_ptr(),
+      block_table.data_ptr<int32_t>(), output.data_ptr(),
+      query.scalar_type() == at::kBFloat16,
+      kv_cache.scalar_type() == at::kBFloat16, cache_blocks_first,
+      num_cache_blocks, block_size, prefix_tokens, query_start_position,
+      sequence_length, query_tokens, query_heads, kv_heads, head_dim,
+      static_cast<float>(softmax_scale), stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("unpack_canonical_storage_chunks_cuda",
         &unpack_canonical_storage_chunks_cuda);
@@ -686,4 +899,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         &cachegen_unpack_dequantize_to_kv_cache_cuda);
   m.def("kivi_dequantize_to_kv_cache_cuda",
         &kivi_dequantize_to_kv_cache_cuda);
+  m.def("fused_prefix_attention_cuda", &fused_prefix_attention_cuda);
 }

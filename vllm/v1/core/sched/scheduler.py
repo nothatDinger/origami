@@ -359,6 +359,35 @@ class Scheduler(SchedulerInterface):
             # Do not schedule any requests when paused.
             token_budget = 0
 
+        origami_config = (
+            getattr(self.connector, "config", None)
+            if self.connector is not None
+            and type(self.connector).__name__ == "OrigamiConnector"
+            else None
+        )
+        origami_policy = getattr(origami_config, "batch_policy", None)
+        origami_fused_enabled = bool(
+            getattr(self.connector, "fused_attention_enabled", False)
+        )
+        origami_fused_budget = (
+            int(getattr(origami_config, "fused_max_requests", 8))
+            if origami_fused_enabled
+            else self.max_num_running_reqs
+        )
+        origami_fused_scheduled = 0
+        origami_resume_pending = False
+        if origami_policy in {"restored_priority_mixed", "restored_only"}:
+            origami_resume_pending = any(
+                self._is_origami_resume_request(request)
+                for request in (
+                    list(self.running) + list(self.waiting) + list(self.skipped_waiting)
+                )
+            )
+            # Stable partition: restored work consumes request/token budgets first.
+            self.running.sort(
+                key=lambda request: not self._is_origami_resume_request(request)
+            )
+
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -374,6 +403,21 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            is_origami_resume = self._is_origami_resume_request(request)
+            if (
+                origami_fused_enabled
+                and is_origami_resume
+                and origami_fused_scheduled >= origami_fused_budget
+            ):
+                req_index += 1
+                continue
+            if (
+                origami_policy == "restored_only"
+                and origami_resume_pending
+                and self._is_origami_cold_prefill(request)
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -399,6 +443,14 @@ class Scheduler(SchedulerInterface):
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            if (
+                origami_resume_pending
+                and self._is_origami_cold_prefill(request)
+            ):
+                num_new_tokens = min(
+                    num_new_tokens,
+                    int(getattr(origami_config, "cold_prefill_chunk_tokens", 1024)),
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -505,6 +557,8 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            if origami_fused_enabled and is_origami_resume:
+                origami_fused_scheduled += 1
             req_index += 1
 
             # Speculative decode related.
@@ -563,6 +617,23 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                is_origami_resume = self._is_origami_resume_request(request)
+                if (
+                    origami_fused_enabled
+                    and is_origami_resume
+                    and origami_fused_scheduled >= origami_fused_budget
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+                if (
+                    origami_policy == "restored_only"
+                    and origami_resume_pending
+                    and self._is_origami_cold_prefill(request)
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -668,6 +739,20 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    if (
+                        origami_resume_pending
+                        and self._is_origami_cold_prefill(request)
+                    ):
+                        num_new_tokens = min(
+                            num_new_tokens,
+                            int(
+                                getattr(
+                                    origami_config,
+                                    "cold_prefill_chunk_tokens",
+                                    1024,
+                                )
+                            ),
+                        )
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -800,6 +885,8 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                if origami_fused_enabled and is_origami_resume:
+                    origami_fused_scheduled += 1
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -1541,6 +1628,25 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    @staticmethod
+    def _is_origami_resume_request(request: Request) -> bool:
+        params = getattr(request, "kv_transfer_params", None)
+        if not isinstance(params, dict):
+            return False
+        if params.get("origami_save_prefill"):
+            return False
+        return bool(
+            params.get("origami_resume_prefill")
+            or params.get("origami_cache_key")
+            or params.get("origami_payload_id")
+        )
+
+    def _is_origami_cold_prefill(self, request: Request) -> bool:
+        return (
+            not self._is_origami_resume_request(request)
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
+
     def _request_has_origami_restore_priority(self, request: Request) -> bool:
         if (
             self.connector is None
@@ -1548,18 +1654,12 @@ class Scheduler(SchedulerInterface):
         ):
             return False
         config = getattr(self.connector, "config", None)
-        if getattr(config, "batch_policy", "restored_priority_mixed") != (
-            "restored_priority_mixed"
-        ):
+        if getattr(config, "batch_policy", "restored_priority_mixed") not in {
+            "restored_priority_mixed",
+            "restored_only",
+        }:
             return False
-        params = getattr(request, "kv_transfer_params", None)
-        if not isinstance(params, dict):
-            return False
-        return bool(
-            params.get("origami_resume_prefill")
-            or params.get("origami_cache_key")
-            or params.get("origami_payload_id")
-        )
+        return self._is_origami_resume_request(request)
 
     def _promote_origami_restored_prefill(
         self, request_queue: RequestQueue
